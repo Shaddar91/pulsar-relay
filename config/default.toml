@@ -1,0 +1,27 @@
+[scheduler]
+#interval in seconds (900 = 15 minutes)
+interval_secs = 900
+#path to AI task automation pipeline ready directory
+pipeline_ready_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/pipeline/ready"
+#path to pipeline processing directory
+pipeline_processing_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/pipeline/processing"
+#path to pipeline completed directory
+pipeline_completed_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/pipeline/completed"
+#path to scheduler's own task queue
+task_queue_dir = "/home/shaddar/Documents/workspace/personal/projects/pulsar-relay/data/tasks"
+#lock file path
+lock_file = "/tmp/pulsar-relay.lock"
+
+[kafka]
+brokers = "localhost:9092"
+task_topic = "pulsar.tasks"
+result_topic = "pulsar.results"
+group_id = "pulsar-relay-scheduler"
+
+[agent]
+#path to spawn-agent-v2.sh
+spawn_script = "/home/shaddar/Documents/workspace/ai-task-automation/scripts/spawn-agent-v2.sh"
+#default model for spawned agents
+default_model = "sonnet"
+#timeout per component in seconds (30 min)
+component_timeout_secs = 1800

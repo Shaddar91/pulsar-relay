@@ -1,0 +1,59 @@
+services:
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: pulsar-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      #KRaft mode (no Zookeeper)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: "pulsar-relay-cluster-001"
+    volumes:
+      - kafka-data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: pulsar-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic pulsar.tasks --partitions 1 --replication-factor 1
+        kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic pulsar.results --partitions 1 --replication-factor 1
+        echo "Topics created:"
+        kafka-topics.sh --bootstrap-server kafka:9092 --list
+        echo "Kafka init complete."
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: pulsar-kafka-ui
+    ports:
+      - "8089:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: pulsar-relay
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  kafka-data:
