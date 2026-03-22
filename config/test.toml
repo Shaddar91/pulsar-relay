@@ -1,0 +1,12 @@
+[scheduler]
+interval_secs = 5
+pipeline_ready_dir = "/tmp/pulsar-relay-test/pipeline/ready"
+pipeline_processing_dir = "/tmp/pulsar-relay-test/pipeline/processing"
+pipeline_completed_dir = "/tmp/pulsar-relay-test/pipeline/completed"
+task_queue_dir = "/tmp/pulsar-relay-test/tasks"
+lock_file = "/tmp/pulsar-relay-test.lock"
+
+[agent]
+spawn_script = "tests/fixtures/mock-spawn-agent.sh"
+default_model = "sonnet"
+component_timeout_secs = 30

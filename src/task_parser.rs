@@ -3,6 +3,22 @@ use std::path::Path;
 use regex::Regex;
 use tracing::debug;
 
+//find the line range for a component section: (header_line, next_header_line_or_none)
+fn find_component_bounds(content: &str, header_pattern: &str) -> (Option<usize>, Option<usize>) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut start = None;
+    for (i, line) in lines.iter().enumerate() {
+        if start.is_none() && line.contains(header_pattern) {
+            start = Some(i);
+            continue;
+        }
+        if start.is_some() && line.starts_with("### Component ") {
+            return (start, Some(i));
+        }
+    }
+    (start, None)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskFile {
     pub path: String,
@@ -112,10 +128,10 @@ impl TaskFile {
             let agent = agent_re.captures(section)
                 .map(|c| c[1].to_string());
 
-            //extract result if present
-            let result = if section.contains("**Result:**") {
-                let result_start = section.find("**Result:**").unwrap() + "**Result:**".len();
-                Some(section[result_start..].trim().to_string())
+            //extract result if present (single line only)
+            let result = if let Some(result_line) = section.lines().find(|l| l.contains("**Result:**")) {
+                let val = result_line.split("**Result:**").nth(1).unwrap_or("").trim();
+                Some(val.to_string())
             } else {
                 None
             };
@@ -174,38 +190,51 @@ impl TaskFile {
         let content = std::fs::read_to_string(path)?;
         let header_pattern = format!("### Component {}:", component_index);
 
+        let (section_start, section_end) = find_component_bounds(&content, &header_pattern);
+        if section_start.is_none() {
+            return Err(anyhow::anyhow!(
+                "component {} not found in {}",
+                component_index,
+                path.display()
+            ));
+        }
+
+        let section_start = section_start.unwrap();
         let mut lines: Vec<String> = content.lines().map(String::from).collect();
-        let mut in_component = false;
-        let mut status_updated = false;
 
-        for i in 0..lines.len() {
-            if lines[i].contains(&header_pattern) {
-                in_component = true;
-                continue;
-            }
-            if in_component && lines[i].starts_with("### Component ") {
-                //reached next component, insert result before it if needed
-                if let Some(res) = result {
-                    if !status_updated {
-                        lines.insert(i, format!("**Result:** {}\n", res));
-                    }
-                }
-                break;
-            }
-            if in_component && lines[i].contains("**Status:**") {
+        //update status line and find last metadata line in component
+        let bound = section_end.unwrap_or(lines.len());
+        let mut last_meta_idx = section_start;
+        for i in section_start..bound {
+            if lines[i].contains("**Status:**") {
                 lines[i] = format!("**Status:** {}", new_status);
-                status_updated = true;
+                last_meta_idx = i;
+            }
+            if lines[i].contains("**Agent:**") {
+                last_meta_idx = i;
             }
         }
 
-        //if we're at the last component and have a result to add
-        if in_component && !status_updated {
-            //status line not found, append to end
-        }
-        if let Some(res) = result {
-            if in_component {
-                lines.push(format!("\n**Result:** {}", res));
+        //remove existing result lines within component bounds
+        if result.is_some() {
+            let mut i = section_start;
+            let cur_bound = section_end.unwrap_or(lines.len());
+            while i < cur_bound && i < lines.len() {
+                if lines[i].contains("**Result:**") {
+                    lines.remove(i);
+                    //adjust last_meta_idx if we removed a line before/at it
+                    if i <= last_meta_idx {
+                        last_meta_idx = last_meta_idx.saturating_sub(1);
+                    }
+                } else {
+                    i += 1;
+                }
             }
+        }
+
+        //insert result after the last metadata line (Status/Agent)
+        if let Some(res) = result {
+            lines.insert(last_meta_idx + 1, format!("**Result:** {}", res));
         }
 
         std::fs::write(path, lines.join("\n"))?;
@@ -255,5 +284,158 @@ Build React components for the dashboard.
         assert_eq!(task.components[1].status, ComponentStatus::Pending);
         assert!(task.scheduler_initiated);
         assert_eq!(task.next_pending().unwrap().index, 2);
+    }
+
+    fn make_task_file(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    fn sample_3_component_task() -> &'static str {
+        r#"# Test Task
+
+**Task ID:** task_test_002
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: First step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do the first thing.
+
+### Component 2: Second step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do the second thing.
+
+### Component 3: Third step
+**Status:** PENDING
+**Agent:** frontend-developer
+
+Do the third thing.
+"#
+    }
+
+    #[test]
+    fn test_update_status_marks_in_progress() {
+        let f = make_task_file(sample_3_component_task());
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::InProgress, None,
+        ).unwrap();
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert_eq!(task.components[0].status, ComponentStatus::InProgress);
+        assert_eq!(task.components[1].status, ComponentStatus::Pending);
+    }
+
+    #[test]
+    fn test_update_status_with_result_mid_component() {
+        let f = make_task_file(sample_3_component_task());
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::Completed, Some("Done: created 3 files"),
+        ).unwrap();
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert_eq!(task.components[0].status, ComponentStatus::Completed);
+        assert_eq!(task.components[0].result.as_deref(), Some("Done: created 3 files"));
+        //component 2 should still be pending and intact
+        assert_eq!(task.components[1].status, ComponentStatus::Pending);
+        assert_eq!(task.components[1].title, "Second step");
+    }
+
+    #[test]
+    fn test_update_status_with_result_last_component() {
+        let f = make_task_file(sample_3_component_task());
+        TaskFile::update_component_status(
+            f.path(), 3, ComponentStatus::Completed, Some("All done"),
+        ).unwrap();
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert_eq!(task.components[2].status, ComponentStatus::Completed);
+        assert_eq!(task.components[2].result.as_deref(), Some("All done"));
+    }
+
+    #[test]
+    fn test_sequential_component_updates() {
+        let f = make_task_file(sample_3_component_task());
+
+        //mark component 1 in-progress then completed
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::InProgress, None,
+        ).unwrap();
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::Completed, Some("Step 1 result"),
+        ).unwrap();
+
+        //mark component 2 in-progress then failed
+        TaskFile::update_component_status(
+            f.path(), 2, ComponentStatus::InProgress, None,
+        ).unwrap();
+        TaskFile::update_component_status(
+            f.path(), 2, ComponentStatus::Failed, Some("Error: timeout"),
+        ).unwrap();
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert_eq!(task.components[0].status, ComponentStatus::Completed);
+        assert_eq!(task.components[0].result.as_deref(), Some("Step 1 result"));
+        assert_eq!(task.components[1].status, ComponentStatus::Failed);
+        assert_eq!(task.components[1].result.as_deref(), Some("Error: timeout"));
+        assert_eq!(task.components[2].status, ComponentStatus::Pending);
+        assert!(!task.is_finished());
+    }
+
+    #[test]
+    fn test_is_finished_when_all_done() {
+        let f = make_task_file(sample_3_component_task());
+
+        for i in 1..=3 {
+            TaskFile::update_component_status(
+                f.path(), i, ComponentStatus::Completed, Some(&format!("Result {}", i)),
+            ).unwrap();
+        }
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert!(task.is_finished());
+        assert!(task.next_pending().is_none());
+    }
+
+    #[test]
+    fn test_has_in_progress() {
+        let f = make_task_file(sample_3_component_task());
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::InProgress, None,
+        ).unwrap();
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert!(task.has_in_progress());
+    }
+
+    #[test]
+    fn test_failed_component_does_not_block_finished() {
+        let content = r#"# Test Task
+
+**Task ID:** task_fail_test
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: Works
+**Status:** COMPLETED
+**Agent:** backend-developer
+**Result:** OK
+
+### Component 2: Fails
+**Status:** FAILED
+**Agent:** backend-developer
+**Result:** Error: something broke
+"#;
+        let f = make_task_file(content);
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert!(task.is_finished());
+        assert!(task.next_pending().is_none());
     }
 }

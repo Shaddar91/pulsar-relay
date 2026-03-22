@@ -142,7 +142,7 @@ impl Scheduler {
         self.process_task_file(&task).await
     }
 
-    async fn process_task_file(&self, task: &TaskFile) -> anyhow::Result<()> {
+    async fn process_task_file(&mut self, task: &TaskFile) -> anyhow::Result<()> {
         //check if something is already in progress
         if task.has_in_progress() {
             info!(
@@ -213,6 +213,13 @@ impl Scheduler {
                 )?;
             }
         }
+
+        //update tracker progress by re-parsing the file
+        let updated_task = TaskFile::parse(Path::new(&task.path))?;
+        let completed = updated_task.components.iter()
+            .filter(|c| c.status == ComponentStatus::Completed || c.status == ComponentStatus::Failed)
+            .count();
+        self.tracker.update_progress(&task.task_id, completed)?;
 
         Ok(())
     }
