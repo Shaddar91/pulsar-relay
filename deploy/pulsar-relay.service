@@ -1,0 +1,33 @@
+[Unit]
+Description=Pulsar Relay - Sequential Task Scheduler for AI Task Automation
+Documentation=file:///home/shaddar/Documents/workspace/personal/projects/forge/projects/pulsar-relay/tasks/implementation-plan.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shaddar/Documents/workspace/personal/projects/pulsar-relay
+ExecStart=/home/shaddar/Documents/workspace/personal/projects/pulsar-relay/target/release/pulsar-relay /home/shaddar/Documents/workspace/personal/projects/pulsar-relay/config/default.toml
+Restart=on-failure
+RestartSec=60
+
+#JSONL output goes to runtime log + journal
+StandardOutput=append:/home/shaddar/Documents/workspace/ai-task-automation/logs/runtime/pulsar-relay.log
+StandardError=append:/home/shaddar/Documents/workspace/ai-task-automation/logs/runtime/pulsar-relay.log
+
+#Environment
+Environment="PATH=/home/shaddar/.cargo/bin:/home/shaddar/.nvm/versions/node/v20.10.0/bin:/usr/local/bin:/usr/bin:/bin:%h/.local/bin"
+Environment="HOME=%h"
+Environment="RUST_LOG=pulsar_relay=info"
+Environment="CLAUDE_BIN=/home/shaddar/.nvm/versions/node/v20.10.0/bin/claude"
+
+#Security settings
+PrivateTmp=true
+NoNewPrivileges=true
+
+#Resource limits
+MemoryLimit=2G
+CPUQuota=200%
+TasksMax=50
+
+[Install]
+WantedBy=default.target
