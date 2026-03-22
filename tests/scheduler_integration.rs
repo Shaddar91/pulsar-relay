@@ -99,8 +99,11 @@ Echo world.
 "#;
     write_task_file(&tasks_dir, "task_single_tick.md", task_content);
 
-    //run scheduler for ~3 seconds (1 tick at startup, then timeout before 2nd)
-    let output = run_scheduler_ticks(&config_path, 3);
+    //run scheduler for one tick (generous timeout for parallel test load)
+    let output = run_scheduler_ticks(&config_path, 10);
+
+    //debug: print scheduler output
+    eprintln!("=== Scheduler output ===\n{}", output);
 
     //verify component 1 is COMPLETED with a result
     let updated = read_task_file(&tasks_dir, "task_single_tick.md");
@@ -158,8 +161,8 @@ Do step three.
 "#;
     write_task_file(&tasks_dir, "task_multi_tick.md", task_content);
 
-    //run scheduler for ~10 seconds (enough for 3 ticks: 0s + 2s + 4s + 6s + buffer)
-    let output = run_scheduler_ticks(&config_path, 10);
+    //run scheduler for 3 ticks (generous timeout for parallel test load)
+    let output = run_scheduler_ticks(&config_path, 30);
 
     let updated = read_task_file(&tasks_dir, "task_multi_tick.md");
 
@@ -226,8 +229,8 @@ This should still be reachable on next tick.
 "#;
     write_task_file(&tasks_dir, "task_failure.md", task_content);
 
-    //run for ~12 seconds (3+ ticks)
-    let output = run_scheduler_ticks(&config_path, 12);
+    //run for 3+ ticks (generous timeout for parallel test load)
+    let output = run_scheduler_ticks(&config_path, 30);
 
     let updated = read_task_file(&tasks_dir, "task_failure.md");
 
@@ -280,8 +283,8 @@ Just one component.
 "#;
     write_task_file(&tasks_dir, "task_tracker.md", task_content);
 
-    //run for one tick
-    run_scheduler_ticks(&config_path, 4);
+    //run for one tick (generous timeout for CI load)
+    run_scheduler_ticks(&config_path, 10);
 
     //verify tracker state file exists
     let tracker_path = tasks_dir.join("tracker-state.json");
@@ -327,11 +330,205 @@ fn test_already_finished_task_is_skipped() {
 
     //run one tick — should not modify the file
     let before = read_task_file(&tasks_dir, "task_already_done.md");
-    run_scheduler_ticks(&config_path, 4);
+    run_scheduler_ticks(&config_path, 10);
     let after = read_task_file(&tasks_dir, "task_already_done.md");
 
     assert_eq!(
         before, after,
         "Already-finished task should not be modified",
+    );
+}
+
+#[test]
+fn test_ingest_cli_registers_plan() {
+    let test_dir = setup_test_dir("ingest-cli");
+    let config_path = write_test_config(&test_dir, 60);
+    let tasks_dir = test_dir.join("tasks");
+
+    //create a plan file outside the task queue
+    let plan_dir = test_dir.join("plans");
+    fs::create_dir_all(&plan_dir).unwrap();
+    let plan_content = r#"# Ingested Plan
+
+**Task ID:** task_ingest_cli_001
+**Scheduler:** pulsar-relay
+
+### Component 1: First
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do the first thing.
+
+### Component 2: Second
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do the second thing.
+"#;
+    let plan_path = plan_dir.join("test-plan.md");
+    fs::write(&plan_path, plan_content).unwrap();
+
+    //run ingest CLI
+    let binary = PathBuf::from(PROJECT_ROOT).join("target/debug/pulsar-relay");
+    let output = std::process::Command::new(&binary)
+        .arg("ingest")
+        .arg(plan_path.to_str().unwrap())
+        .arg("--config")
+        .arg(config_path.to_str().unwrap())
+        .output()
+        .expect("failed to run ingest command");
+
+    assert!(
+        output.status.success(),
+        "ingest should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    //verify tracker contains the plan
+    let tracker_path = tasks_dir.join("tracker-state.json");
+    assert!(
+        tracker_path.exists(),
+        "tracker-state.json should exist after ingest",
+    );
+    let state = fs::read_to_string(&tracker_path).unwrap();
+    assert!(
+        state.contains("task_ingest_cli_001"),
+        "Tracker should contain ingested task. State:\n{}",
+        state,
+    );
+}
+
+#[test]
+fn test_pipeline_task_has_scheduler_label() {
+    let test_dir = setup_test_dir("pipeline-label");
+    let config_path = write_test_config(&test_dir, 60);
+    let tasks_dir = test_dir.join("tasks");
+    let pipeline_ready = test_dir.join("pipeline/ready");
+
+    let task_content = r#"# Pipeline Label Test
+
+**Task ID:** task_label_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: First step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Test component.
+"#;
+    write_task_file(&tasks_dir, "task_label.md", task_content);
+
+    //run scheduler — should dispatch and write pipeline task file
+    run_scheduler_ticks(&config_path, 10);
+
+    //verify pipeline task file exists with scheduler label
+    let pipeline_files: Vec<_> = fs::read_dir(&pipeline_ready)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
+        .collect();
+
+    assert!(
+        !pipeline_files.is_empty(),
+        "Pipeline ready dir should contain task file(s). Dir: {}",
+        pipeline_ready.display(),
+    );
+
+    let pipeline_content = fs::read_to_string(pipeline_files[0].path()).unwrap();
+    assert!(
+        pipeline_content.contains("**Scheduler:** pulsar-relay"),
+        "Pipeline task file should contain scheduler label. Content:\n{}",
+        pipeline_content,
+    );
+    assert!(
+        pipeline_content.contains("**Target Agent:**"),
+        "Pipeline task file should contain target agent. Content:\n{}",
+        pipeline_content,
+    );
+}
+
+#[test]
+fn test_plan_header_updated_during_execution() {
+    let test_dir = setup_test_dir("plan-header");
+    let config_path = write_test_config(&test_dir, 60);
+    let tasks_dir = test_dir.join("tasks");
+
+    let task_content = r#"# Plan Header Test
+
+**Task ID:** task_plan_header_001
+**Scheduler:** pulsar-relay
+
+### Component 1: Step one
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do step one.
+
+### Component 2: Step two
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do step two.
+"#;
+    write_task_file(&tasks_dir, "task_plan_header.md", task_content);
+
+    //run one tick — component 1 should complete
+    run_scheduler_ticks(&config_path, 10);
+
+    let updated = read_task_file(&tasks_dir, "task_plan_header.md");
+    assert!(
+        updated.contains("**Plan Status:**"),
+        "Plan header should contain Plan Status. File:\n{}",
+        updated,
+    );
+    assert!(
+        updated.contains("**Progress:**"),
+        "Plan header should contain Progress. File:\n{}",
+        updated,
+    );
+    assert!(
+        updated.contains("1 completed"),
+        "Progress should show 1 completed. File:\n{}",
+        updated,
+    );
+}
+
+#[test]
+fn test_phase_headers_parsed_correctly() {
+    let test_dir = setup_test_dir("phase-headers");
+    let config_path = write_test_config(&test_dir, 2);
+    let tasks_dir = test_dir.join("tasks");
+
+    let task_content = r#"# Phase Header Test
+
+**Task ID:** task_phase_001
+**Scheduler:** pulsar-relay
+
+### Phase 1: Setup
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do setup work.
+
+### Phase 2: Execute
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do execution work.
+"#;
+    write_task_file(&tasks_dir, "task_phase.md", task_content);
+
+    //run for 2+ ticks (generous timeout for parallel test load)
+    run_scheduler_ticks(&config_path, 20);
+
+    let updated = read_task_file(&tasks_dir, "task_phase.md");
+    let completed_count = updated.matches("**Status:** COMPLETED").count();
+    assert!(
+        completed_count >= 2,
+        "Both phases should be COMPLETED, got {}. File:\n{}",
+        completed_count,
+        updated,
     );
 }

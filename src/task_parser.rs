@@ -3,16 +3,23 @@ use std::path::Path;
 use regex::Regex;
 use tracing::debug;
 
+//check if a line is a component/phase header
+fn is_section_header(line: &str) -> bool {
+    line.starts_with("### Component ") || line.starts_with("### Phase ")
+}
+
 //find the line range for a component section: (header_line, next_header_line_or_none)
-fn find_component_bounds(content: &str, header_pattern: &str) -> (Option<usize>, Option<usize>) {
+fn find_component_bounds(content: &str, component_index: usize) -> (Option<usize>, Option<usize>) {
     let lines: Vec<&str> = content.lines().collect();
+    let component_pattern = format!("### Component {}:", component_index);
+    let phase_pattern = format!("### Phase {}:", component_index);
     let mut start = None;
     for (i, line) in lines.iter().enumerate() {
-        if start.is_none() && line.contains(header_pattern) {
+        if start.is_none() && (line.contains(&component_pattern) || line.contains(&phase_pattern)) {
             start = Some(i);
             continue;
         }
-        if start.is_some() && line.starts_with("### Component ") {
+        if start.is_some() && is_section_header(line) {
             return (start, Some(i));
         }
     }
@@ -96,7 +103,8 @@ impl TaskFile {
     }
 
     fn parse_components(content: &str) -> anyhow::Result<Vec<Component>> {
-        let re = Regex::new(r"(?m)^### Component (\d+):\s*(.+)$")?;
+        //support both ### Component N: and ### Phase N: headers
+        let re = Regex::new(r"(?m)^### (?:Component|Phase) (\d+):\s*(.+)$")?;
         let status_re = Regex::new(r"\*\*Status:\*\*\s*(\w+)")?;
         let agent_re = Regex::new(r"\*\*Agent:\*\*\s*(\S+)")?;
 
@@ -188,9 +196,8 @@ impl TaskFile {
         result: Option<&str>,
     ) -> anyhow::Result<()> {
         let content = std::fs::read_to_string(path)?;
-        let header_pattern = format!("### Component {}:", component_index);
 
-        let (section_start, section_end) = find_component_bounds(&content, &header_pattern);
+        let (section_start, section_end) = find_component_bounds(&content, component_index);
         if section_start.is_none() {
             return Err(anyhow::anyhow!(
                 "component {} not found in {}",
@@ -236,6 +243,55 @@ impl TaskFile {
         if let Some(res) = result {
             lines.insert(last_meta_idx + 1, format!("**Result:** {}", res));
         }
+
+        std::fs::write(path, lines.join("\n"))?;
+        Ok(())
+    }
+
+    //update the plan header with overall progress metadata
+    pub fn update_plan_header(path: &Path) -> anyhow::Result<()> {
+        let task = Self::parse(path)?;
+        let total = task.components.len();
+        let completed = task.components.iter()
+            .filter(|c| c.status == ComponentStatus::Completed)
+            .count();
+        let failed = task.components.iter()
+            .filter(|c| c.status == ComponentStatus::Failed)
+            .count();
+        let in_progress = task.components.iter()
+            .filter(|c| c.status == ComponentStatus::InProgress)
+            .count();
+
+        let overall_status = if task.is_finished() {
+            "COMPLETED".to_string()
+        } else if in_progress > 0 {
+            format!("IN_PROGRESS ({}/{} done)", completed + failed, total)
+        } else if completed > 0 || failed > 0 {
+            format!("IN_PROGRESS ({}/{} done)", completed + failed, total)
+        } else {
+            "PENDING".to_string()
+        };
+
+        let progress_line = format!(
+            "**Progress:** {}/{} components ({} completed, {} failed)",
+            completed + failed, total, completed, failed
+        );
+        let status_line = format!("**Plan Status:** {}", overall_status);
+
+        let content = std::fs::read_to_string(path)?;
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+
+        //remove existing plan metadata lines
+        lines.retain(|l| !l.starts_with("**Plan Status:**") && !l.starts_with("**Progress:**"));
+
+        //insert after the title line (first # line)
+        let insert_idx = lines.iter()
+            .position(|l| l.starts_with("# "))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        lines.insert(insert_idx, progress_line);
+        lines.insert(insert_idx, status_line);
 
         std::fs::write(path, lines.join("\n"))?;
         Ok(())
@@ -412,6 +468,99 @@ Do the third thing.
 
         let task = TaskFile::parse(f.path()).unwrap();
         assert!(task.has_in_progress());
+    }
+
+    #[test]
+    fn test_parse_phase_headers() {
+        let content = r#"# Phase-Based Plan
+
+**Task ID:** task_phase_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Phase 1: Database Setup
+**Status:** COMPLETED
+**Agent:** backend-developer
+**Result:** Tables created
+
+### Phase 2: API Layer
+**Status:** PENDING
+**Agent:** backend-developer
+
+Build the REST API.
+
+### Phase 3: Frontend
+**Status:** PENDING
+**Agent:** frontend-developer
+
+Build the UI.
+"#;
+        let f = make_task_file(content);
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert_eq!(task.components.len(), 3);
+        assert_eq!(task.components[0].status, ComponentStatus::Completed);
+        assert_eq!(task.components[0].title, "Database Setup");
+        assert_eq!(task.components[1].status, ComponentStatus::Pending);
+        assert_eq!(task.next_pending().unwrap().index, 2);
+    }
+
+    #[test]
+    fn test_update_phase_header_status() {
+        let content = r#"# Phase Plan
+
+**Task ID:** task_phase_update
+**Scheduler:** pulsar-relay
+
+### Phase 1: Step one
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do it.
+
+### Phase 2: Step two
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do it too.
+"#;
+        let f = make_task_file(content);
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::Completed, Some("Done"),
+        ).unwrap();
+
+        let task = TaskFile::parse(f.path()).unwrap();
+        assert_eq!(task.components[0].status, ComponentStatus::Completed);
+        assert_eq!(task.components[0].result.as_deref(), Some("Done"));
+        assert_eq!(task.components[1].status, ComponentStatus::Pending);
+    }
+
+    #[test]
+    fn test_update_plan_header() {
+        let f = make_task_file(sample_3_component_task());
+        TaskFile::update_component_status(
+            f.path(), 1, ComponentStatus::Completed, Some("OK"),
+        ).unwrap();
+        TaskFile::update_plan_header(f.path()).unwrap();
+
+        let content = std::fs::read_to_string(f.path()).unwrap();
+        assert!(content.contains("**Plan Status:**"), "Should have Plan Status");
+        assert!(content.contains("**Progress:** 1/3"), "Should show 1/3 progress");
+    }
+
+    #[test]
+    fn test_plan_header_completed() {
+        let f = make_task_file(sample_3_component_task());
+        for i in 1..=3 {
+            TaskFile::update_component_status(
+                f.path(), i, ComponentStatus::Completed, Some(&format!("R{}", i)),
+            ).unwrap();
+        }
+        TaskFile::update_plan_header(f.path()).unwrap();
+
+        let content = std::fs::read_to_string(f.path()).unwrap();
+        assert!(content.contains("**Plan Status:** COMPLETED"), "Should be COMPLETED");
+        assert!(content.contains("**Progress:** 3/3"), "Should show 3/3");
     }
 
     #[test]

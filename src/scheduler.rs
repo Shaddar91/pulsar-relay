@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::task_parser::{TaskFile, ComponentStatus};
+use crate::task_parser::{TaskFile, Component, ComponentStatus};
 #[cfg(feature = "kafka")]
 use crate::kafka::producer::TaskProducer;
 use crate::agent::AgentSpawner;
@@ -12,6 +12,77 @@ use fs2::FileExt;
 pub struct Scheduler {
     config: Config,
     tracker: TaskTracker,
+}
+
+//write a pipeline task file for a dispatched component
+fn write_pipeline_task(
+    pipeline_ready_dir: &Path,
+    task: &TaskFile,
+    component: &Component,
+) -> anyhow::Result<String> {
+    fs::create_dir_all(pipeline_ready_dir)?;
+
+    let sanitized_id = task.task_id.replace(' ', "_").replace('/', "_");
+    let filename = format!("task_pulsar_{}_{}.md", sanitized_id, component.index);
+    let agent = component.agent.as_deref().unwrap_or("backend-developer");
+
+    let content = format!(
+        r#"# Task: {} — Component {}
+
+**Task ID:** {}_component_{}
+**Created:** {}
+**Scheduler:** pulsar-relay
+**Plan File:** {}
+**Component:** {}
+**Priority:** Medium
+**Type:** code
+**Target Agent:** {}
+**Agent Available:** Yes
+**Routing Confidence:** 95%
+**Ready Status:** READY_FOR_EXECUTION
+
+## Summary
+Component {} of plan "{}": {}
+
+## Instructions
+
+{}
+
+## Dynamic Agent Config
+```json
+{{
+  "agent": "{}",
+  "source": "agents/models/default/{}.json"
+}}
+```
+"#,
+        task.title,
+        component.index,
+        sanitized_id,
+        component.index,
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+        task.path,
+        component.index,
+        agent,
+        component.index,
+        task.title,
+        component.title,
+        component.content,
+        agent,
+        agent,
+    );
+
+    let filepath = pipeline_ready_dir.join(&filename);
+    fs::write(&filepath, content)?;
+
+    info!(
+        file = %filepath.display(),
+        task_id = %task.task_id,
+        component = component.index,
+        "pipeline task file written"
+    );
+
+    Ok(filename)
 }
 
 impl Scheduler {
@@ -158,6 +229,10 @@ impl Scheduler {
             None => {
                 if task.is_finished() {
                     info!(task_id = %task.task_id, "all components finished");
+                    //update plan header to reflect completion
+                    if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
+                        warn!(error = %e, "failed to update plan header");
+                    }
                 }
                 return Ok(());
             }
@@ -171,6 +246,15 @@ impl Scheduler {
             "dispatching component to agent"
         );
 
+        //write pipeline task file for tracking/labeling
+        if let Err(e) = write_pipeline_task(
+            &self.config.scheduler.pipeline_ready_dir,
+            task,
+            component,
+        ) {
+            warn!(error = %e, "failed to write pipeline task file (non-fatal)");
+        }
+
         //mark component as in-progress
         TaskFile::update_component_status(
             Path::new(&task.path),
@@ -178,6 +262,11 @@ impl Scheduler {
             ComponentStatus::InProgress,
             None,
         )?;
+
+        //update plan header to show progress
+        if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
+            warn!(error = %e, "failed to update plan header");
+        }
 
         //spawn agent to work on this component
         let agent_name = component.agent.as_deref()
@@ -212,6 +301,11 @@ impl Scheduler {
                     Some(&format!("Error: {}", e)),
                 )?;
             }
+        }
+
+        //update plan header after component completion
+        if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
+            warn!(error = %e, "failed to update plan header");
         }
 
         //update tracker progress by re-parsing the file
