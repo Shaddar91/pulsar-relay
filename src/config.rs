@@ -134,6 +134,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
 
     fn minimal_toml() -> &'static str {
@@ -174,6 +175,7 @@ failed_dir = "/toml/failed"
     }
 
     #[test]
+    #[serial]
     fn test_config_loads_with_plans_section() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_toml(tmp.path(), &toml_with_plans());
@@ -193,6 +195,7 @@ failed_dir = "/toml/failed"
     }
 
     #[test]
+    #[serial]
     fn test_config_loads_without_plans_section() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_toml(tmp.path(), minimal_toml());
@@ -209,6 +212,7 @@ failed_dir = "/toml/failed"
     }
 
     #[test]
+    #[serial]
     fn test_env_vars_override_toml_plans() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_toml(tmp.path(), &toml_with_plans());
@@ -233,6 +237,7 @@ failed_dir = "/toml/failed"
     }
 
     #[test]
+    #[serial]
     fn test_env_vars_provide_plans_when_toml_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_toml(tmp.path(), minimal_toml());
@@ -255,6 +260,7 @@ failed_dir = "/toml/failed"
     }
 
     #[test]
+    #[serial]
     fn test_default_toml_loads() {
         //Verify the actual config/default.toml loads without error
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
