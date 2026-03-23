@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,21 @@ pub struct AgentConfig {
     pub component_timeout_secs: u64,
 }
 
+//Expand ${VAR} patterns in a path using env vars.
+//Unknown vars are kept as literal ${VAR}.
+fn expand_path(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if !s.contains("${") {
+        return path;
+    }
+    let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
+    let expanded = re.replace_all(&s, |caps: &regex::Captures| {
+        let var = &caps[1];
+        std::env::var(var).unwrap_or_else(|_| format!("${{{}}}", var))
+    });
+    PathBuf::from(expanded.into_owned())
+}
+
 //Apply env var override if set, otherwise keep TOML value
 fn env_override(toml_val: PathBuf, env_key: &str) -> PathBuf {
     std::env::var(env_key)
@@ -76,6 +92,20 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
         let mut config: Config = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("failed to parse config: {}", e))?;
+
+        //Expand ${VAR} patterns in all PathBuf fields
+        config.scheduler.pipeline_ready_dir = expand_path(config.scheduler.pipeline_ready_dir);
+        config.scheduler.pipeline_processing_dir = expand_path(config.scheduler.pipeline_processing_dir);
+        config.scheduler.pipeline_completed_dir = expand_path(config.scheduler.pipeline_completed_dir);
+        config.scheduler.task_queue_dir = expand_path(config.scheduler.task_queue_dir);
+        config.scheduler.lock_file = expand_path(config.scheduler.lock_file);
+        config.agent.spawn_script = expand_path(config.agent.spawn_script);
+        if let Some(ref mut p) = config.plans {
+            p.drafts_dir = expand_path(std::mem::take(&mut p.drafts_dir));
+            p.active_dir = expand_path(std::mem::take(&mut p.active_dir));
+            p.completed_dir = expand_path(std::mem::take(&mut p.completed_dir));
+            p.failed_dir = expand_path(std::mem::take(&mut p.failed_dir));
+        }
 
         //Resolve plans config: env vars override TOML, or build from env if TOML absent
         config.plans = match config.plans {
@@ -239,5 +269,45 @@ failed_dir = "/toml/failed"
             assert!(plans.drafts_dir.to_str().unwrap().contains("drafts"));
             assert!(plans.active_dir.to_str().unwrap().contains("active"));
         }
+    }
+
+    //--- expand_path unit tests ---
+    //These tests use HOME (always set) and a unique nonexistent var name,
+    //so they're safe to run multi-threaded without env var races.
+
+    #[test]
+    fn test_expand_path_known_var() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_path(PathBuf::from("${HOME}/foo"));
+        assert_eq!(result, PathBuf::from(format!("{}/foo", home)));
+    }
+
+    #[test]
+    fn test_expand_path_unknown_var() {
+        let result = expand_path(PathBuf::from("${NONEXISTENT_VAR_12345}/foo"));
+        assert_eq!(result, PathBuf::from("${NONEXISTENT_VAR_12345}/foo"));
+    }
+
+    #[test]
+    fn test_expand_path_mixed() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_path(PathBuf::from("/static/${HOME}/more"));
+        assert_eq!(result, PathBuf::from(format!("/static/{}/more", home)));
+    }
+
+    #[test]
+    fn test_expand_path_no_var() {
+        let result = expand_path(PathBuf::from("/plain/path"));
+        assert_eq!(result, PathBuf::from("/plain/path"));
+    }
+
+    #[test]
+    fn test_expand_path_empty_var_value() {
+        //Use a unique var name to avoid races
+        let var_name = format!("_PULSAR_TEST_EMPTY_{}", std::process::id());
+        std::env::set_var(&var_name, "");
+        let result = expand_path(PathBuf::from(format!("${{{}}}/foo", var_name)));
+        assert_eq!(result, PathBuf::from("/foo"));
+        std::env::remove_var(&var_name);
     }
 }
