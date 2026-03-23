@@ -21,82 +21,69 @@ pub struct Scheduler {
     kafka_consumer: Option<ResultConsumer>,
 }
 
-//write a pipeline task file for a dispatched component
-fn write_pipeline_task(
-    pipeline_ready_dir: &Path,
-    task: &TaskFile,
-    component: &Component,
-) -> anyhow::Result<String> {
-    fs::create_dir_all(pipeline_ready_dir)?;
-
-    let sanitized_id = task.task_id.replace(' ', "_").replace('/', "_");
-    let filename = format!("task_pulsar_{}_{}.md", sanitized_id, component.index);
-    let agent = component.agent.as_deref().unwrap_or("backend-developer");
-
-    let content = format!(
-        r#"# Task: {} — Component {}
-
-**Task ID:** {}_component_{}
-**Created:** {}
-**Scheduler:** pulsar-relay
-**Plan File:** {}
-**Component:** {}
-**Priority:** Medium
-**Type:** code
-**Target Agent:** {}
-**Agent Available:** Yes
-**Routing Confidence:** 95%
-**Ready Status:** READY_FOR_EXECUTION
-
-## Summary
-Component {} of plan "{}": {}
-
-## Instructions
-
-{}
-
-## Dynamic Agent Config
-```json
-{{
-  "agent": "{}",
-  "source": "agents/models/default/{}.json"
-}}
-```
-"#,
-        task.title,
-        component.index,
-        sanitized_id,
-        component.index,
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-        task.path,
-        component.index,
-        agent,
-        component.index,
-        task.title,
-        component.title,
-        component.content,
-        agent,
-        agent,
-    );
-
-    let filepath = pipeline_ready_dir.join(&filename);
-    fs::write(&filepath, content)?;
-
-    info!(
-        file = %filepath.display(),
-        task_id = %task.task_id,
-        component = component.index,
-        "pipeline task file written"
-    );
-
-    Ok(filename)
-}
-
 //count completed + failed components
 fn count_done_components(task: &TaskFile) -> usize {
     task.components.iter()
         .filter(|c| c.status == ComponentStatus::Completed || c.status == ComponentStatus::Failed)
         .count()
+}
+
+//check if any pipeline task files for this task exist in ready/ or processing/ dirs
+//prevents dispatching next component while pipeline executor is still running previous one
+fn has_in_flight_pipeline_tasks(
+    ready_dir: &Path,
+    processing_dir: &Path,
+    task_id: &str,
+) -> bool {
+    let sanitized_id = task_id.replace(' ', "_").replace('/', "_");
+    let prefix = format!("task_pulsar_{}_", sanitized_id);
+
+    for dir in [ready_dir, processing_dir] {
+        if dir.exists() {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.starts_with(&prefix) {
+                            info!(
+                                dir = %dir.display(),
+                                file = %name,
+                                task_id = %task_id,
+                                "found in-flight pipeline task"
+                            );
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+//remove pipeline task files for a completed/failed component
+fn cleanup_pipeline_task(
+    ready_dir: &Path,
+    processing_dir: &Path,
+    task_id: &str,
+    component_index: usize,
+) {
+    let sanitized_id = task_id.replace(' ', "_").replace('/', "_");
+    let filename = format!("task_pulsar_{}_{}.md", sanitized_id, component_index);
+
+    for dir in [ready_dir, processing_dir] {
+        let path = dir.join(&filename);
+        if path.exists() {
+            if let Err(e) = fs::remove_file(&path) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to clean up pipeline task file"
+                );
+            } else {
+                info!(path = %path.display(), "cleaned up pipeline task file");
+            }
+        }
+    }
 }
 
 //check if plan file changed since last known checksum
@@ -350,19 +337,42 @@ impl Scheduler {
         let task = TaskFile::parse(path)?;
         self.dispatch_next_component(&task).await?;
 
-        //store new checksum AFTER dispatch (dispatch modifies the plan file)
-        if let Ok(new_hash) = checksum::hash_file(path) {
-            self.tracker.set_checksum(task_ref, &new_hash)?;
+        //only cache checksum when there's nothing to dispatch on next tick:
+        //- no pending components (all done), or
+        //- a component is in progress (must wait for it to complete)
+        //if there are still pending components and nothing in-progress,
+        //DON'T cache — next tick needs to dispatch
+        let updated = TaskFile::parse(path)?;
+        let has_pending = updated.next_pending().is_some();
+        let has_in_progress = updated.has_in_progress();
+
+        if !has_pending || has_in_progress {
+            if let Ok(new_hash) = checksum::hash_file(path) {
+                self.tracker.set_checksum(task_ref, &new_hash)?;
+            }
         }
 
         Ok(())
     }
 
-    //dispatch the next pending component via filesystem + kafka
+    //dispatch the next pending component — strict sequential enforcement
+    //FIX: removed write_pipeline_task (caused dual execution with pipeline executors)
+    //scheduler now handles execution directly via agent spawn only
     async fn dispatch_next_component(&mut self, task: &TaskFile) -> anyhow::Result<()> {
-        //strict sequential: skip if any component is currently in progress
+        //strict sequential check 1: skip if any component is marked IN_PROGRESS in plan file
         if task.has_in_progress() {
-            info!(task_id = %task.task_id, "component still in progress, waiting");
+            info!(task_id = %task.task_id, "component still in progress (plan file), waiting");
+            return Ok(());
+        }
+
+        //strict sequential check 2: skip if pipeline has in-flight tasks for this plan
+        //catches stale task files from before this fix + race conditions
+        if has_in_flight_pipeline_tasks(
+            &self.config.scheduler.pipeline_ready_dir,
+            &self.config.scheduler.pipeline_processing_dir,
+            &task.task_id,
+        ) {
+            info!(task_id = %task.task_id, "pipeline task still in flight (ready/ or processing/), waiting");
             return Ok(());
         }
 
@@ -388,19 +398,7 @@ impl Scheduler {
             "dispatching component"
         );
 
-        //1. write pipeline task file (filesystem dispatch)
-        if let Err(e) = write_pipeline_task(
-            &self.config.scheduler.pipeline_ready_dir,
-            task,
-            component,
-        ) {
-            warn!(error = %e, "failed to write pipeline task file (non-fatal)");
-        }
-
-        //2. publish to kafka (non-fatal — filesystem is fallback)
-        self.publish_dispatch_to_kafka(task, component).await;
-
-        //3. mark component as in-progress
+        //1. mark IN_PROGRESS FIRST — before any dispatch (closes race window)
         TaskFile::update_component_status(
             Path::new(&task.path),
             component.index,
@@ -412,7 +410,11 @@ impl Scheduler {
             warn!(error = %e, "failed to update plan header");
         }
 
-        //4. spawn agent to work on this component
+        //2. publish to kafka (informational — no pipeline task file written)
+        self.publish_dispatch_to_kafka(task, component).await;
+
+        //3. spawn agent directly (blocking — waits for completion)
+        //NO write_pipeline_task — scheduler handles execution, not pipeline executors
         let agent_name = component.agent.as_deref().unwrap_or("backend-developer");
         let spawner = AgentSpawner::new(&self.config.agent);
 
@@ -445,6 +447,14 @@ impl Scheduler {
                 )?;
             }
         }
+
+        //4. clean up any stale pipeline task files (backward compat)
+        cleanup_pipeline_task(
+            &self.config.scheduler.pipeline_ready_dir,
+            &self.config.scheduler.pipeline_processing_dir,
+            &task.task_id,
+            component.index,
+        );
 
         //5. update plan header and tracker
         if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
@@ -484,6 +494,128 @@ impl Scheduler {
         {
             let _ = (task, component);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_has_in_flight_pipeline_tasks_empty_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        assert!(!has_in_flight_pipeline_tasks(&ready, &processing, "task_test_001"));
+    }
+
+    #[test]
+    fn test_has_in_flight_pipeline_tasks_finds_ready() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        //place a pipeline task in ready/
+        fs::write(
+            ready.join("task_pulsar_task_test_001_1.md"),
+            "# pipeline task",
+        ).unwrap();
+
+        assert!(has_in_flight_pipeline_tasks(&ready, &processing, "task_test_001"));
+    }
+
+    #[test]
+    fn test_has_in_flight_pipeline_tasks_finds_processing() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        //place a pipeline task in processing/
+        fs::write(
+            processing.join("task_pulsar_task_test_001_2.md"),
+            "# pipeline task",
+        ).unwrap();
+
+        assert!(has_in_flight_pipeline_tasks(&ready, &processing, "task_test_001"));
+    }
+
+    #[test]
+    fn test_has_in_flight_pipeline_tasks_ignores_other_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        //place a pipeline task for a DIFFERENT task
+        fs::write(
+            ready.join("task_pulsar_task_other_999_1.md"),
+            "# other task",
+        ).unwrap();
+
+        assert!(!has_in_flight_pipeline_tasks(&ready, &processing, "task_test_001"));
+    }
+
+    #[test]
+    fn test_has_in_flight_pipeline_tasks_nonexistent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("nonexistent_ready");
+        let processing = tmp.path().join("nonexistent_processing");
+
+        //should not panic on nonexistent dirs
+        assert!(!has_in_flight_pipeline_tasks(&ready, &processing, "task_test_001"));
+    }
+
+    #[test]
+    fn test_cleanup_pipeline_task_removes_file() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        let ready_file = ready.join("task_pulsar_task_test_001_1.md");
+        fs::write(&ready_file, "# task").unwrap();
+        assert!(ready_file.exists());
+
+        cleanup_pipeline_task(&ready, &processing, "task_test_001", 1);
+        assert!(!ready_file.exists());
+    }
+
+    #[test]
+    fn test_cleanup_pipeline_task_removes_from_processing() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        let proc_file = processing.join("task_pulsar_task_test_001_2.md");
+        fs::write(&proc_file, "# task").unwrap();
+        assert!(proc_file.exists());
+
+        cleanup_pipeline_task(&ready, &processing, "task_test_001", 2);
+        assert!(!proc_file.exists());
+    }
+
+    #[test]
+    fn test_cleanup_pipeline_task_noop_when_no_file() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let processing = tmp.path().join("processing");
+        fs::create_dir_all(&ready).unwrap();
+        fs::create_dir_all(&processing).unwrap();
+
+        //should not panic
+        cleanup_pipeline_task(&ready, &processing, "task_test_001", 3);
     }
 }
 
