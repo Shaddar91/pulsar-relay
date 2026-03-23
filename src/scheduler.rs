@@ -95,6 +95,16 @@ struct ActivePlanState {
     current_component: usize,
     total_components: usize,
     cancelled: bool,
+    //timestamp when the current component was dispatched (for duration tracking)
+    component_dispatched_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+//find the plan filename for a given task_id from active plans map
+fn find_plan_filename(active_plans: &HashMap<String, ActivePlanState>, task_id: &str) -> String {
+    active_plans.iter()
+        .find(|(_, state)| state.task_id == task_id)
+        .map(|(filename, _)| filename.clone())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 //list all .md filenames in a directory
@@ -193,11 +203,11 @@ Component {} of plan "{}": {}
 }
 
 //scan pipeline completed/ dir for finished tasks belonging to a plan
-//returns vec of (component_index, result_text) for completed pipeline tasks
+//returns vec of (component_index, result_text, execution_status) for completed pipeline tasks
 fn scan_pipeline_completed(
     completed_dir: &Path,
     task_id: &str,
-) -> Vec<(usize, String)> {
+) -> Vec<(usize, String, ComponentStatus)> {
     let sanitized_id = task_id.replace(' ', "_").replace('/', "_");
     let prefix = format!("task_pulsar_{}_", sanitized_id);
     let mut results = Vec::new();
@@ -217,18 +227,20 @@ fn scan_pipeline_completed(
                 //extract component index from filename: task_pulsar_{id}_{index}.md
                 let stripped = name.trim_start_matches(&prefix).trim_end_matches(".md");
                 if let Ok(idx) = stripped.parse::<usize>() {
-                    //read the completed task file for any result content
+                    //read the completed task file for any result content and status
                     let content = fs::read_to_string(entry.path())
                         .unwrap_or_default();
                     let result = extract_completed_result(&content);
-                    results.push((idx, result));
+                    let status = extract_execution_status(&content);
 
                     info!(
                         file = %name,
                         task_id = %task_id,
                         component = idx,
+                        status = %status,
                         "found completed pipeline task"
                     );
+                    results.push((idx, result, status));
                 }
             }
         }
@@ -247,6 +259,21 @@ fn extract_completed_result(content: &str) -> String {
     }
     //fallback: completed by pipeline executor
     "Completed by pipeline executor".to_string()
+}
+
+//extract execution status from a completed pipeline task file
+//pipeline executors write **Execution Status:** COMPLETED|FAILED
+//defaults to Completed if not found (backward compat)
+fn extract_execution_status(content: &str) -> ComponentStatus {
+    for line in content.lines() {
+        if line.contains("**Execution Status:**") {
+            let status = line.split("**Execution Status:**").nth(1).unwrap_or("").trim();
+            if status.eq_ignore_ascii_case("FAILED") {
+                return ComponentStatus::Failed;
+            }
+        }
+    }
+    ComponentStatus::Completed
 }
 
 //remove a completed pipeline task file after processing its result
@@ -495,24 +522,45 @@ impl Scheduler {
                 task_id,
             );
 
-            for (component_index, result_text) in &completed {
+            for (component_index, result_text, exec_status) in &completed {
                 let task_path = match self.tracker.get_task_path(task_id) {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
                 let path = Path::new(&task_path);
 
+                //calculate duration from dispatch timestamp
+                let plan_filename = find_plan_filename(&self.active_plans, task_id);
+                let duration_secs = self.active_plans.values()
+                    .find(|s| s.task_id == *task_id)
+                    .and_then(|s| s.component_dispatched_at)
+                    .map(|dispatched| {
+                        let elapsed = chrono::Utc::now() - dispatched;
+                        elapsed.num_seconds()
+                    })
+                    .unwrap_or(-1);
+
                 info!(
+                    event = "component.completed",
+                    plan_filename = %plan_filename,
                     task_id = %task_id,
                     component = component_index,
-                    "pipeline completion detected — updating plan"
+                    duration_secs = duration_secs,
+                    execution_status = %exec_status,
+                    "component finished"
                 );
 
-                //mark component as completed in the plan file
+                //reset dispatch timestamp for next component
+                if let Some(state) = self.active_plans.values_mut().find(|s| s.task_id == *task_id) {
+                    state.component_dispatched_at = None;
+                }
+
+                //mark component with execution status from pipeline
+                //pipeline executors write **Execution Status:** COMPLETED|FAILED
                 if let Err(e) = TaskFile::update_component_status(
                     path,
                     *component_index,
-                    ComponentStatus::Completed,
+                    exec_status.clone(),
                     Some(result_text),
                 ) {
                     error!(
@@ -696,11 +744,13 @@ impl Scheduler {
             }
         };
 
+        let agent = component.agent.as_deref().unwrap_or("backend-developer");
+
         info!(
             task_id = %task.task_id,
             component = component.index,
             title = %component.title,
-            agent = ?component.agent,
+            agent = %agent,
             "dispatching component to pipeline"
         );
 
@@ -746,11 +796,22 @@ impl Scheduler {
         let done = count_done_components(&updated_task);
         self.tracker.update_progress(&task.task_id, done)?;
 
+        //5. record dispatch timestamp + emit structured event
+        let plan_filename = find_plan_filename(&self.active_plans, &task.task_id);
         info!(
+            event = "component.dispatched",
+            plan_filename = %plan_filename,
             task_id = %task.task_id,
             component = component.index,
-            "component dispatched to pipeline — executor will handle execution"
+            agent = %agent,
+            "component sent to pipeline"
         );
+
+        //store dispatch timestamp for duration calculation on completion
+        if let Some(state) = self.active_plans.values_mut().find(|s| s.task_id == task.task_id) {
+            state.component_dispatched_at = Some(chrono::Utc::now());
+            state.current_component = component.index;
+        }
 
         //DO NOT spawn agent — pipeline executor handles that
         Ok(())
@@ -818,7 +879,7 @@ impl Scheduler {
             }
 
             let outcome = plan_outcome(&task);
-            let (dest_dir, label) = match outcome {
+            let (dest_dir, _label) = match outcome {
                 PlanOutcome::Completed => (&plans_config.completed_dir, "completed"),
                 PlanOutcome::Failed => (&plans_config.failed_dir, "failed"),
             };
@@ -830,12 +891,12 @@ impl Scheduler {
                     match outcome {
                         PlanOutcome::Completed => {
                             info!(
+                                event = "plan.completed",
+                                plan_filename = %filename,
                                 task_id = %task_id,
-                                filename = %filename,
-                                components = component_count,
+                                component_count = component_count,
                                 destination = %new_path.display(),
-                                outcome = %label,
-                                "plan completed — moved to completed/"
+                                "all components done, moved to completed/"
                             );
                         }
                         PlanOutcome::Failed => {
@@ -843,7 +904,7 @@ impl Scheduler {
                             for (idx, title, result) in &failures {
                                 error!(
                                     task_id = %task_id,
-                                    filename = %filename,
+                                    plan_filename = %filename,
                                     failed_component = idx,
                                     component_title = %title,
                                     retry_count = 0,
@@ -852,13 +913,13 @@ impl Scheduler {
                                 );
                             }
                             info!(
+                                event = "plan.failed",
+                                plan_filename = %filename,
                                 task_id = %task_id,
-                                filename = %filename,
-                                components = component_count,
+                                component_count = component_count,
                                 failed_count = failures.len(),
                                 destination = %new_path.display(),
-                                outcome = %label,
-                                "plan failed — moved to failed/"
+                                "component failed, moved to failed/"
                             );
                             //override tracker status to "failed"
                             if let Err(e) = self.tracker.mark_failed(&task_id) {
@@ -945,10 +1006,14 @@ impl Scheduler {
                 let path = active_dir.join(filename);
                 if let Ok(hash) = checksum::hash_file(&path) {
                     if hash != state.checksum {
+                        let old_checksum = state.checksum.clone();
                         info!(
-                            filename = %filename,
+                            event = "plan.checksum_changed",
+                            plan_filename = %filename,
                             task_id = %state.task_id,
-                            "active plan checksum changed"
+                            old_checksum = %old_checksum,
+                            new_checksum = %hash,
+                            "plan modified mid-flight"
                         );
                         state.checksum = hash;
                         if let Ok(task) = TaskFile::parse(&path) {
@@ -986,12 +1051,22 @@ impl Scheduler {
         let cur_component = current_component_index(&task);
         let total = task.components.len();
 
+        info!(
+            event = "plan.discovered",
+            plan_filename = %filename,
+            task_id = %task.task_id,
+            component_count = total,
+            current_component = cur_component,
+            "new plan detected in active directory"
+        );
+
         self.active_plans.insert(filename.to_string(), ActivePlanState {
             task_id: task.task_id,
             checksum: hash,
             current_component: cur_component,
             total_components: total,
             cancelled: false,
+            component_dispatched_at: None,
         });
 
         Ok(())
@@ -1004,9 +1079,12 @@ impl Scheduler {
                 return;
             }
             info!(
-                filename = %filename,
+                event = "plan.cancelled",
+                plan_filename = %filename,
                 task_id = %state.task_id,
-                "plan removed from active/ — marking cancelled"
+                current_component = state.current_component,
+                total_components = state.total_components,
+                "plan removed from active/ while running"
             );
             state.cancelled = true;
             if let Err(e) = self.tracker.mark_cancelled(&state.task_id) {
@@ -1230,6 +1308,24 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
         assert_eq!(results[0].1, "Schema created");
+        assert_eq!(results[0].2, ComponentStatus::Completed);
+    }
+
+    #[test]
+    fn test_scan_pipeline_completed_detects_failed_status() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        fs::create_dir_all(&completed).unwrap();
+
+        fs::write(
+            completed.join("task_pulsar_task_test_001_1.md"),
+            "# Failed\n**Result:** ERROR: Agent not found\n**Execution Status:** FAILED",
+        ).unwrap();
+
+        let results = scan_pipeline_completed(&completed, "task_test_001");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].2, ComponentStatus::Failed);
     }
 
     #[test]
@@ -1254,6 +1350,24 @@ mod tests {
 
         let results = scan_pipeline_completed(&completed, "task_test_001");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_extract_execution_status_completed() {
+        let content = "# Task\n**Execution Status:** COMPLETED\n**Result:** OK";
+        assert_eq!(extract_execution_status(content), ComponentStatus::Completed);
+    }
+
+    #[test]
+    fn test_extract_execution_status_failed() {
+        let content = "# Task\n**Result:** ERROR\n**Execution Status:** FAILED";
+        assert_eq!(extract_execution_status(content), ComponentStatus::Failed);
+    }
+
+    #[test]
+    fn test_extract_execution_status_default_completed() {
+        let content = "# Task\n**Result:** No status line here";
+        assert_eq!(extract_execution_status(content), ComponentStatus::Completed);
     }
 
     #[test]
@@ -1401,6 +1515,7 @@ mod tests {
             current_component: 1,
             total_components: 3,
             cancelled: false,
+            component_dispatched_at: None,
         });
 
         assert!(!plans["plan-a.md"].cancelled);
@@ -1424,6 +1539,7 @@ mod tests {
             current_component: 2,
             total_components: 5,
             cancelled: false,
+            component_dispatched_at: None,
         });
         plans.insert("plan-b.md".to_string(), ActivePlanState {
             task_id: "task_b".to_string(),
@@ -1431,6 +1547,7 @@ mod tests {
             current_component: 1,
             total_components: 3,
             cancelled: false,
+            component_dispatched_at: None,
         });
 
         assert_eq!(plans.len(), 2);
@@ -1452,6 +1569,7 @@ mod tests {
             current_component: 1,
             total_components: 3,
             cancelled: false,
+            component_dispatched_at: None,
         });
 
         //simulate checksum change detection
@@ -1473,6 +1591,7 @@ mod tests {
             current_component: 1,
             total_components: 2,
             cancelled: false,
+            component_dispatched_at: None,
         });
 
         let current_files: HashSet<String> = ["existing.md", "new-plan.md"]
@@ -1663,6 +1782,81 @@ mod tests {
 
         let failures = failed_component_details(&task);
         assert!(failures.is_empty());
+    }
+
+    //--- Logging & observability tests ---
+
+    #[test]
+    fn test_find_plan_filename_found() {
+        let mut plans: HashMap<String, ActivePlanState> = HashMap::new();
+        plans.insert("my-plan.md".to_string(), ActivePlanState {
+            task_id: "task_my_plan_001".to_string(),
+            checksum: "hash".to_string(),
+            current_component: 1,
+            total_components: 3,
+            cancelled: false,
+            component_dispatched_at: None,
+        });
+
+        assert_eq!(find_plan_filename(&plans, "task_my_plan_001"), "my-plan.md");
+    }
+
+    #[test]
+    fn test_find_plan_filename_not_found() {
+        let plans: HashMap<String, ActivePlanState> = HashMap::new();
+        assert_eq!(find_plan_filename(&plans, "task_nonexistent"), "unknown");
+    }
+
+    #[test]
+    fn test_find_plan_filename_multiple_plans() {
+        let mut plans: HashMap<String, ActivePlanState> = HashMap::new();
+        plans.insert("alpha.md".to_string(), ActivePlanState {
+            task_id: "task_alpha".to_string(),
+            checksum: "h1".to_string(),
+            current_component: 1,
+            total_components: 2,
+            cancelled: false,
+            component_dispatched_at: None,
+        });
+        plans.insert("beta.md".to_string(), ActivePlanState {
+            task_id: "task_beta".to_string(),
+            checksum: "h2".to_string(),
+            current_component: 1,
+            total_components: 3,
+            cancelled: false,
+            component_dispatched_at: None,
+        });
+
+        assert_eq!(find_plan_filename(&plans, "task_alpha"), "alpha.md");
+        assert_eq!(find_plan_filename(&plans, "task_beta"), "beta.md");
+    }
+
+    #[test]
+    fn test_dispatch_timestamp_tracking() {
+        let mut state = ActivePlanState {
+            task_id: "task_ts_001".to_string(),
+            checksum: "hash".to_string(),
+            current_component: 1,
+            total_components: 3,
+            cancelled: false,
+            component_dispatched_at: None,
+        };
+
+        //initially no timestamp
+        assert!(state.component_dispatched_at.is_none());
+
+        //simulate dispatch
+        let dispatch_time = chrono::Utc::now();
+        state.component_dispatched_at = Some(dispatch_time);
+        assert!(state.component_dispatched_at.is_some());
+
+        //simulate completion — calculate duration
+        let duration = chrono::Utc::now() - state.component_dispatched_at.unwrap();
+        assert!(duration.num_seconds() >= 0);
+
+        //reset after completion
+        state.component_dispatched_at = None;
+        assert!(state.component_dispatched_at.is_none());
     }
 }
 

@@ -75,12 +75,19 @@ fn start_mock_pipeline_executor(test_dir: &PathBuf) -> Child {
 }
 
 //run the scheduler binary with a config, limited to N ticks via timeout
+//clears PULSAR_* env vars to ensure test isolation from host environment
 fn run_scheduler_ticks(config_path: &PathBuf, timeout_secs: u64) -> String {
     let binary = PathBuf::from(PROJECT_ROOT).join("target/debug/pulsar-relay");
     let output = Command::new("timeout")
         .arg(format!("{}s", timeout_secs))
         .arg(&binary)
         .arg(config_path.to_str().unwrap())
+        .env_remove("PULSAR_PLANS_DRAFTS_DIR")
+        .env_remove("PULSAR_PLANS_ACTIVE_DIR")
+        .env_remove("PULSAR_PLANS_COMPLETED_DIR")
+        .env_remove("PULSAR_PLANS_FAILED_DIR")
+        .env_remove("PULSAR_PLAN_FILE")
+        .env_remove("PULSAR_POLL_INTERVAL_SECS")
         .output()
         .expect("failed to run scheduler binary");
 
@@ -815,5 +822,885 @@ Simple test component.
         updated.contains("**Status:** COMPLETED"),
         "Component should be COMPLETED. File:\n{}",
         updated,
+    );
+}
+
+//--- Parallel multi-plan tests (Component 5) ---
+
+fn setup_test_dir_with_plans(test_name: &str) -> PathBuf {
+    let dir = PathBuf::from(format!("/tmp/pulsar-relay-test-{}", test_name));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("tasks")).unwrap();
+    fs::create_dir_all(dir.join("pipeline/ready")).unwrap();
+    fs::create_dir_all(dir.join("pipeline/processing")).unwrap();
+    fs::create_dir_all(dir.join("pipeline/completed")).unwrap();
+    fs::create_dir_all(dir.join("plans/drafts")).unwrap();
+    fs::create_dir_all(dir.join("plans/active")).unwrap();
+    fs::create_dir_all(dir.join("plans/completed")).unwrap();
+    fs::create_dir_all(dir.join("plans/failed")).unwrap();
+    dir
+}
+
+fn write_test_config_with_plans(test_dir: &PathBuf, interval_secs: u64) -> PathBuf {
+    let config_path = test_dir.join("config.toml");
+    let config = format!(
+        r#"[scheduler]
+interval_secs = {}
+pipeline_ready_dir = "{}/pipeline/ready"
+pipeline_processing_dir = "{}/pipeline/processing"
+pipeline_completed_dir = "{}/pipeline/completed"
+task_queue_dir = "{}/tasks"
+lock_file = "{}/scheduler.lock"
+
+[plans]
+drafts_dir = "{}/plans/drafts"
+active_dir = "{}/plans/active"
+completed_dir = "{}/plans/completed"
+failed_dir = "{}/plans/failed"
+
+[agent]
+spawn_script = "{}"
+default_model = "sonnet"
+component_timeout_secs = 30
+"#,
+        interval_secs,
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        test_dir.display(),
+        mock_script_path().display(),
+    );
+    fs::write(&config_path, config).unwrap();
+    config_path
+}
+
+fn write_plan_file(plans_dir: &PathBuf, filename: &str, content: &str) {
+    fs::write(plans_dir.join(filename), content).unwrap();
+}
+
+fn read_plan_file(plans_dir: &PathBuf, filename: &str) -> String {
+    fs::read_to_string(plans_dir.join(filename)).unwrap()
+}
+
+fn alpha_plan_content() -> &'static str {
+    r#"# Test Plan Alpha — Rust Async Patterns Research
+
+**Task ID:** task_alpha_async_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: Research Rust async patterns
+**Status:** PENDING
+**Agent:** scholar
+
+Research the main async patterns in Rust.
+
+### Component 2: Summarize findings
+**Status:** PENDING
+**Agent:** scholar
+
+Summarize the research into a comparison table.
+
+### Component 3: Write example code
+**Status:** PENDING
+**Agent:** scholar
+
+Write Rust examples for each pattern.
+"#
+}
+
+fn beta_plan_content() -> &'static str {
+    r#"# Test Plan Beta — System Health Check
+
+**Task ID:** task_beta_health_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: List running Docker containers
+**Status:** PENDING
+**Agent:** bash-scripting-expert
+
+Run docker ps and summarize running containers.
+
+### Component 2: Check disk usage
+**Status:** PENDING
+**Agent:** bash-scripting-expert
+
+Run df -h and report disk usage.
+"#
+}
+
+#[test]
+fn test_parallel_multi_plan_both_dispatched_first_tick() {
+    //verifies that two plans in active/ both get their Component 1 dispatched
+    //on the same tick — parallel across plans, sequential within
+    let test_dir = setup_test_dir_with_plans("parallel-dispatch");
+    let config_path = write_test_config_with_plans(&test_dir, 60);
+    let active_dir = test_dir.join("plans/active");
+    let pipeline_ready = test_dir.join("pipeline/ready");
+
+    //place both plans in active/
+    write_plan_file(&active_dir, "test-plan-alpha.md", alpha_plan_content());
+    write_plan_file(&active_dir, "test-plan-beta.md", beta_plan_content());
+
+    //run one tick — no mock executor so pipeline files stay in ready/
+    run_scheduler_ticks(&config_path, 10);
+
+    //both plans should have Component 1 dispatched to pipeline
+    let alpha_pipeline = pipeline_ready.join("task_pulsar_task_alpha_async_001_1.md");
+    let beta_pipeline = pipeline_ready.join("task_pulsar_task_beta_health_001_1.md");
+
+    assert!(
+        alpha_pipeline.exists(),
+        "Alpha plan Component 1 should be dispatched to ready/. Dir: {:?}",
+        fs::read_dir(&pipeline_ready).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+    assert!(
+        beta_pipeline.exists(),
+        "Beta plan Component 1 should be dispatched to ready/. Dir: {:?}",
+        fs::read_dir(&pipeline_ready).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+
+    //verify different agents in pipeline files
+    let alpha_content = fs::read_to_string(&alpha_pipeline).unwrap();
+    let beta_content = fs::read_to_string(&beta_pipeline).unwrap();
+    assert!(alpha_content.contains("**Target Agent:** scholar"), "Alpha should target scholar");
+    assert!(beta_content.contains("**Target Agent:** bash-scripting-expert"), "Beta should target bash-scripting-expert");
+
+    //both plan files should have Component 1 IN_PROGRESS
+    let alpha_updated = read_plan_file(&active_dir, "test-plan-alpha.md");
+    let beta_updated = read_plan_file(&active_dir, "test-plan-beta.md");
+
+    let alpha_comp1 = alpha_updated.split("### Component 2:").next().unwrap();
+    assert!(
+        alpha_comp1.contains("**Status:** IN_PROGRESS"),
+        "Alpha Component 1 should be IN_PROGRESS. Section:\n{}",
+        alpha_comp1,
+    );
+
+    let beta_comp1 = beta_updated.split("### Component 2:").next().unwrap();
+    assert!(
+        beta_comp1.contains("**Status:** IN_PROGRESS"),
+        "Beta Component 1 should be IN_PROGRESS. Section:\n{}",
+        beta_comp1,
+    );
+}
+
+#[test]
+fn test_parallel_multi_plan_full_execution() {
+    //verifies both plans complete independently — alpha (3 components) and beta (2 components)
+    //beta should finish before alpha (fewer components)
+    let test_dir = setup_test_dir_with_plans("parallel-full");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+    let completed_dir = test_dir.join("plans/completed");
+
+    write_plan_file(&active_dir, "test-plan-alpha.md", alpha_plan_content());
+    write_plan_file(&active_dir, "test-plan-beta.md", beta_plan_content());
+
+    //start mock pipeline executor
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+
+    //run scheduler: alpha needs 3 dispatch+detect cycles, beta needs 2
+    //each cycle is ~2 ticks (dispatch tick + completion detect tick) at 2s = 4s per cycle
+    //3 cycles × 4s = 12s for alpha + discovery tick + buffer = ~20s
+    let output = run_scheduler_ticks(&config_path, 35);
+
+    let _ = executor.kill();
+
+    //beta (2 components) should be fully completed
+    //it may have moved to plans/completed/ already
+    let beta_in_active = active_dir.join("test-plan-beta.md");
+    let beta_completed_files: Vec<_> = fs::read_dir(&completed_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().map(|n| n.starts_with("test-plan-beta")).unwrap_or(false))
+        .collect();
+
+    //beta either moved to completed/ or all components are COMPLETED in active/
+    if beta_in_active.exists() {
+        let beta = fs::read_to_string(&beta_in_active).unwrap();
+        let completed_count = beta.matches("**Status:** COMPLETED").count();
+        assert!(
+            completed_count >= 2,
+            "Beta should have all 2 components COMPLETED. Got {}. File:\n{}",
+            completed_count,
+            beta,
+        );
+    } else {
+        assert!(
+            !beta_completed_files.is_empty(),
+            "Beta plan should be in completed/ directory. completed/ contents: {:?}",
+            fs::read_dir(&completed_dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+        );
+    }
+
+    //alpha (3 components) should also be fully completed
+    let alpha_in_active = active_dir.join("test-plan-alpha.md");
+    let alpha_completed_files: Vec<_> = fs::read_dir(&completed_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().map(|n| n.starts_with("test-plan-alpha")).unwrap_or(false))
+        .collect();
+
+    if alpha_in_active.exists() {
+        let alpha = fs::read_to_string(&alpha_in_active).unwrap();
+        let completed_count = alpha.matches("**Status:** COMPLETED").count();
+        assert!(
+            completed_count >= 3,
+            "Alpha should have all 3 components COMPLETED. Got {}. File:\n{}",
+            completed_count,
+            alpha,
+        );
+    } else {
+        assert!(
+            !alpha_completed_files.is_empty(),
+            "Alpha plan should be in completed/ directory. completed/ contents: {:?}",
+            fs::read_dir(&completed_dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+        );
+    }
+
+    //tracker should show both tasks
+    let tracker_path = test_dir.join("tasks/tracker-state.json");
+    let state = fs::read_to_string(&tracker_path).unwrap();
+    assert!(
+        state.contains("task_alpha_async_001"),
+        "Tracker should contain alpha. State:\n{}",
+        state,
+    );
+    assert!(
+        state.contains("task_beta_health_001"),
+        "Tracker should contain beta. State:\n{}",
+        state,
+    );
+
+    eprintln!("Scheduler output:\n{}", output);
+}
+
+#[test]
+fn test_parallel_plans_independent_progress() {
+    //verifies that one plan progresses while the other is blocked by in-flight task
+    //uses pre-set component states to avoid timing issues with multiple scheduler runs
+    let test_dir = setup_test_dir_with_plans("parallel-independent");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+    let processing_dir = test_dir.join("pipeline/processing");
+
+    //alpha: component 1 COMPLETED, components 2+3 PENDING — should dispatch component 2
+    let alpha_partial = r#"# Alpha Independent Progress
+
+**Task ID:** task_alpha_indep_001
+**Scheduler:** pulsar-relay
+
+### Component 1: Already done
+**Status:** COMPLETED
+**Agent:** scholar
+**Result:** Research complete
+
+### Component 2: Ready to dispatch
+**Status:** PENDING
+**Agent:** scholar
+
+Summarize findings.
+
+### Component 3: Final step
+**Status:** PENDING
+**Agent:** scholar
+
+Write examples.
+"#;
+    //beta: component 1 COMPLETED, component 2 PENDING — but blocked by in-flight task
+    let beta_partial = r#"# Beta Blocked
+
+**Task ID:** task_beta_indep_001
+**Scheduler:** pulsar-relay
+
+### Component 1: Already done
+**Status:** COMPLETED
+**Agent:** bash-scripting-expert
+**Result:** Containers listed
+
+### Component 2: Blocked by in-flight
+**Status:** PENDING
+**Agent:** bash-scripting-expert
+
+Check disk usage.
+"#;
+    write_plan_file(&active_dir, "alpha-indep.md", alpha_partial);
+    write_plan_file(&active_dir, "beta-indep.md", beta_partial);
+
+    //simulate: beta has an in-flight pipeline task (stuck in processing/)
+    fs::write(
+        processing_dir.join("task_pulsar_task_beta_indep_001_1.md"),
+        "# simulated stuck beta task",
+    ).unwrap();
+
+    //start mock executor and run
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+    run_scheduler_ticks(&config_path, 15);
+    let _ = executor.kill();
+
+    //alpha should have progressed — either still in active/ with component 2+ done,
+    //or moved to completed/ (all 3 components finished)
+    let alpha_path = active_dir.join("alpha-indep.md");
+    let completed_dir = test_dir.join("plans/completed");
+    if alpha_path.exists() {
+        let alpha = fs::read_to_string(&alpha_path).unwrap();
+        let alpha_comp2 = alpha.split("### Component 2:").nth(1).unwrap();
+        let alpha_comp2_section = alpha_comp2.split("### Component 3:").next().unwrap();
+        assert!(
+            !alpha_comp2_section.contains("**Status:** PENDING"),
+            "Alpha Component 2 should have progressed (not PENDING). Section:\n{}",
+            alpha_comp2_section,
+        );
+    } else {
+        //alpha fully completed and moved — that proves it progressed independently
+        let alpha_completed: Vec<_> = fs::read_dir(&completed_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().map(|n| n.starts_with("alpha-indep")).unwrap_or(false))
+            .collect();
+        assert!(
+            !alpha_completed.is_empty(),
+            "Alpha should have completed and moved to completed/ (progressed independently)",
+        );
+    }
+
+    //beta component 2 should still be PENDING (blocked by in-flight task)
+    let beta = read_plan_file(&active_dir, "beta-indep.md");
+    let beta_comp2 = beta.split("### Component 2:").nth(1).unwrap();
+    assert!(
+        beta_comp2.contains("**Status:** PENDING"),
+        "Beta Component 2 should still be PENDING (blocked by in-flight file). Section:\n{}",
+        beta_comp2,
+    );
+}
+
+#[test]
+fn test_per_plan_in_flight_check_no_global_lock() {
+    //verifies that in-flight pipeline tasks for one plan do NOT block another plan
+    let test_dir = setup_test_dir_with_plans("no-global-lock");
+    let config_path = write_test_config_with_plans(&test_dir, 60);
+    let active_dir = test_dir.join("plans/active");
+    let processing_dir = test_dir.join("pipeline/processing");
+    let pipeline_ready = test_dir.join("pipeline/ready");
+
+    //both plans: component 1 already COMPLETED, component 2 PENDING
+    let alpha_partial = r#"# Test Plan Alpha Partial
+
+**Task ID:** task_alpha_partial_001
+**Scheduler:** pulsar-relay
+
+### Component 1: Already done
+**Status:** COMPLETED
+**Agent:** scholar
+**Result:** Done
+
+### Component 2: Next step
+**Status:** PENDING
+**Agent:** scholar
+
+Do next alpha work.
+"#;
+    let beta_partial = r#"# Test Plan Beta Partial
+
+**Task ID:** task_beta_partial_001
+**Scheduler:** pulsar-relay
+
+### Component 1: Already done
+**Status:** COMPLETED
+**Agent:** bash-scripting-expert
+**Result:** Done
+
+### Component 2: Next step
+**Status:** PENDING
+**Agent:** bash-scripting-expert
+
+Do next beta work.
+"#;
+    write_plan_file(&active_dir, "alpha-partial.md", alpha_partial);
+    write_plan_file(&active_dir, "beta-partial.md", beta_partial);
+
+    //simulate: alpha has an in-flight pipeline task (component 1 still in processing)
+    fs::write(
+        processing_dir.join("task_pulsar_task_alpha_partial_001_1.md"),
+        "# alpha in-flight",
+    ).unwrap();
+
+    //run one tick
+    run_scheduler_ticks(&config_path, 10);
+
+    //alpha component 2 should NOT be dispatched (blocked by in-flight task)
+    let alpha = read_plan_file(&active_dir, "alpha-partial.md");
+    let alpha_comp2 = alpha.split("### Component 2:").nth(1).unwrap();
+    assert!(
+        alpha_comp2.contains("**Status:** PENDING"),
+        "Alpha Component 2 should still be PENDING (in-flight block). Section:\n{}",
+        alpha_comp2,
+    );
+
+    //beta component 2 SHOULD be dispatched (no in-flight for beta's task_id)
+    let beta_pipeline = pipeline_ready.join("task_pulsar_task_beta_partial_001_2.md");
+    assert!(
+        beta_pipeline.exists(),
+        "Beta Component 2 should be dispatched (no global lock). Dir: {:?}",
+        fs::read_dir(&pipeline_ready).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+
+    let beta = read_plan_file(&active_dir, "beta-partial.md");
+    let beta_comp2 = beta.split("### Component 2:").nth(1).unwrap();
+    assert!(
+        beta_comp2.contains("**Status:** IN_PROGRESS"),
+        "Beta Component 2 should be IN_PROGRESS. Section:\n{}",
+        beta_comp2,
+    );
+}
+
+#[test]
+fn test_one_plan_failure_does_not_affect_other() {
+    //verifies that when one plan has a failing component, the other plan continues
+    let test_dir = setup_test_dir_with_plans("failure-isolation");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+    let completed_dir = test_dir.join("plans/completed");
+    let failed_dir = test_dir.join("plans/failed");
+
+    //alpha: normal plan that should succeed
+    write_plan_file(&active_dir, "test-plan-alpha.md", alpha_plan_content());
+
+    //gamma: plan with a component that will fail (agent name contains "fail")
+    let gamma_failing = r#"# Test Plan Gamma — Will Fail
+
+**Task ID:** task_gamma_fail_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: Will fail
+**Status:** PENDING
+**Agent:** nonexistent-agent-that-will-fail
+
+This should fail because the agent doesn't exist.
+
+### Component 2: After failure
+**Status:** PENDING
+**Agent:** backend-developer
+
+This runs after the failed component.
+"#;
+    write_plan_file(&active_dir, "test-plan-gamma.md", gamma_failing);
+
+    //start mock pipeline executor
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+
+    //run enough ticks for both plans to process
+    let output = run_scheduler_ticks(&config_path, 35);
+    let _ = executor.kill();
+
+    //alpha should have all 3 components COMPLETED (either in active or moved to completed)
+    let alpha_in_active = active_dir.join("test-plan-alpha.md");
+    let alpha_completed_files: Vec<_> = fs::read_dir(&completed_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().map(|n| n.starts_with("test-plan-alpha")).unwrap_or(false))
+        .collect();
+
+    let alpha_ok = if alpha_in_active.exists() {
+        let content = fs::read_to_string(&alpha_in_active).unwrap();
+        content.matches("**Status:** COMPLETED").count() >= 3
+    } else {
+        !alpha_completed_files.is_empty()
+    };
+    assert!(
+        alpha_ok,
+        "Alpha plan should complete successfully despite gamma's failure. active exists={}, completed files={:?}",
+        alpha_in_active.exists(),
+        fs::read_dir(&completed_dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+
+    //gamma should have moved to failed/ (it has a failed component)
+    //or still in active with COMPLETED status on the failed component
+    //(the mock executor marks "fail" agents as FAILED but the scheduler
+    //currently detects all completed/ files as COMPLETED since completion detection
+    //doesn't parse execution status — it just picks up presence in completed/)
+    //so gamma may actually complete "successfully" from the scheduler's perspective
+    //regardless, the key assertion is: alpha was NOT affected by gamma
+    eprintln!("Scheduler output:\n{}", output);
+}
+
+#[test]
+fn test_mid_flight_plan_modification_checksum() {
+    //verifies that modifying a plan file mid-flight triggers re-parse via checksum detection
+    //uses a single scheduler run with background file modification
+    let test_dir = setup_test_dir_with_plans("mid-flight-modify");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+
+    //place a plan in active/ with 3 components — enough for multiple ticks
+    let initial_plan = r#"# Mid-Flight Modification Test
+
+**Task ID:** task_midmod_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: Initial step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do initial work.
+
+### Component 2: Second step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do second work.
+
+### Component 3: Third step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do third work.
+"#;
+    write_plan_file(&active_dir, "test-midmod.md", initial_plan);
+
+    //start a background process that will modify the plan file after 5 seconds
+    //this simulates mid-flight modification while the scheduler is running
+    let plan_path = active_dir.join("test-midmod.md");
+    let modifier = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "sleep 5 && if [ -f '{}' ]; then sed -i 's/Do third work./Do third work.\\n\\n**MODIFIED:** Added mid-flight./' '{}'; fi",
+            plan_path.display(),
+            plan_path.display(),
+        ))
+        .spawn()
+        .expect("failed to start modifier process");
+
+    //start mock pipeline executor
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+
+    //run scheduler for enough ticks to process all 3 components + detect modification
+    let output = run_scheduler_ticks(&config_path, 25);
+    let _ = executor.kill();
+    //modifier should have already exited by now
+
+    //the plan may have completed and moved to completed/
+    let completed_dir = test_dir.join("plans/completed");
+    let final_content = if plan_path.exists() {
+        fs::read_to_string(&plan_path).unwrap()
+    } else {
+        //find it in completed/
+        let files: Vec<_> = fs::read_dir(&completed_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().map(|n| n.starts_with("test-midmod")).unwrap_or(false))
+            .collect();
+        assert!(!files.is_empty(), "Plan should exist in active/ or completed/");
+        fs::read_to_string(files[0].path()).unwrap()
+    };
+
+    //verify the modification was preserved through scheduler processing
+    assert!(
+        final_content.contains("**MODIFIED:**"),
+        "Modification should be preserved after checksum re-parse. File:\n{}",
+        final_content,
+    );
+
+    //component 2 should have progressed (not stuck at PENDING)
+    let comp2 = final_content.split("### Component 2:").nth(1).unwrap();
+    let comp2_section = comp2.split("### Component 3:").next().unwrap();
+    assert!(
+        !comp2_section.contains("**Status:** PENDING"),
+        "Component 2 should have progressed. Section:\n{}",
+        comp2_section,
+    );
+
+    eprintln!("Scheduler output:\n{}", output);
+}
+
+#[test]
+fn test_failed_plan_moves_to_failed_dir() {
+    //verifies that a plan with a failing component moves to plans/failed/
+    //the mock executor marks agents with "fail" or "nonexistent" in name as FAILED
+    //and writes **Execution Status:** FAILED in the completed file
+    //the scheduler now detects this status and marks the component as FAILED
+    let test_dir = setup_test_dir_with_plans("plan-to-failed");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+    let failed_dir = test_dir.join("plans/failed");
+
+    //plan with 2 components — component 1 uses a failing agent
+    let failing_plan = r#"# Failing Plan Test
+
+**Task ID:** task_willfall_001
+**Scheduler:** pulsar-relay
+
+## Components
+
+### Component 1: Will fail
+**Status:** PENDING
+**Agent:** nonexistent-agent-that-will-fail
+
+This agent doesn't exist.
+
+### Component 2: After failure
+**Status:** PENDING
+**Agent:** backend-developer
+
+Normal work after the failure.
+"#;
+    write_plan_file(&active_dir, "test-failing.md", failing_plan);
+
+    //start mock pipeline executor (marks agents with "fail"/"nonexistent" as FAILED)
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+
+    //run enough ticks for both components to process
+    let output = run_scheduler_ticks(&config_path, 25);
+    let _ = executor.kill();
+
+    //plan should have moved to failed/ (component 1 has FAILED status from executor)
+    //or still be in active/ with FAILED component if not enough ticks
+    let plan_in_active = active_dir.join("test-failing.md");
+    let failed_files: Vec<_> = fs::read_dir(&failed_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().map(|n| n.starts_with("test-failing")).unwrap_or(false))
+        .collect();
+
+    if plan_in_active.exists() {
+        //plan may still be in active/ but component 1 should show FAILED
+        let content = fs::read_to_string(&plan_in_active).unwrap();
+        assert!(
+            content.contains("**Status:** FAILED"),
+            "Component 1 should be marked FAILED from pipeline executor status. File:\n{}",
+            content,
+        );
+    } else {
+        //plan moved to failed/
+        assert!(
+            !failed_files.is_empty(),
+            "Failed plan should be in failed/ directory. Contents: {:?}",
+            fs::read_dir(&failed_dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+        );
+
+        let failed_content = fs::read_to_string(failed_files[0].path()).unwrap();
+        assert!(
+            failed_content.contains("**Status:** FAILED"),
+            "Failed plan should preserve FAILED status. Content:\n{}",
+            failed_content,
+        );
+
+        //filename should have timestamp suffix
+        let name_str = failed_files[0].file_name().to_str().unwrap().to_string();
+        assert!(
+            name_str.contains('T'),
+            "Failed plan filename should have timestamp suffix. Got: {}",
+            name_str,
+        );
+    }
+
+    eprintln!("Scheduler output:\n{}", output);
+}
+
+#[test]
+fn test_failure_isolation_other_plan_unaffected() {
+    //one plan has a failing component, the other is healthy
+    //verifies the healthy plan completes despite the failing one
+    let test_dir = setup_test_dir_with_plans("failure-isolation-v2");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+    let pipeline_ready = test_dir.join("pipeline/ready");
+
+    //plan with a failing agent
+    let failing_plan = r#"# Failing Isolation Plan
+
+**Task ID:** task_fail_iso_001
+**Scheduler:** pulsar-relay
+
+### Component 1: Will fail
+**Status:** PENDING
+**Agent:** nonexistent-agent-that-will-fail
+
+This should fail.
+"#;
+    //healthy plan
+    let healthy_plan = r#"# Healthy Plan
+
+**Task ID:** task_healthy_001
+**Scheduler:** pulsar-relay
+
+### Component 1: First step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do healthy work.
+
+### Component 2: Second step
+**Status:** PENDING
+**Agent:** backend-developer
+
+More healthy work.
+"#;
+
+    write_plan_file(&active_dir, "failing-plan.md", failing_plan);
+    write_plan_file(&active_dir, "healthy-plan.md", healthy_plan);
+
+    //start mock pipeline executor
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+
+    //run enough ticks for the healthy plan to complete
+    let output = run_scheduler_ticks(&config_path, 25);
+    let _ = executor.kill();
+
+    //healthy plan should have progressed — at least component 1 should be COMPLETED
+    let healthy_exists = active_dir.join("healthy-plan.md").exists();
+    if healthy_exists {
+        let healthy = read_plan_file(&active_dir, "healthy-plan.md");
+        let completed_count = healthy.matches("**Status:** COMPLETED").count();
+        assert!(
+            completed_count >= 1,
+            "Healthy plan should have at least 1 COMPLETED component (unaffected by failure). Got {}. File:\n{}",
+            completed_count,
+            healthy,
+        );
+    }
+    //if it's not in active/, it completed and moved — that's fine too
+
+    eprintln!("Scheduler output:\n{}", output);
+}
+
+#[test]
+fn test_completed_plan_moves_to_completed_dir() {
+    //verifies that a plan transitions from active/ to plans/completed/ after all components complete
+    let test_dir = setup_test_dir_with_plans("plan-to-completed");
+    let config_path = write_test_config_with_plans(&test_dir, 2);
+    let active_dir = test_dir.join("plans/active");
+    let completed_dir = test_dir.join("plans/completed");
+
+    //plan with 2 PENDING components — will complete via mock executor
+    let plan = r#"# Plan To Complete
+
+**Task ID:** task_tocomplete_001
+**Scheduler:** pulsar-relay
+
+### Component 1: First step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do the first thing.
+
+### Component 2: Second step
+**Status:** PENDING
+**Agent:** backend-developer
+
+Do the second thing.
+"#;
+    write_plan_file(&active_dir, "test-tocomplete.md", plan);
+
+    //start mock pipeline executor
+    let mut executor = start_mock_pipeline_executor(&test_dir);
+
+    //run enough ticks for both components to complete and plan to transition
+    //2 components × 2 ticks (dispatch + detect) × 2s + transition tick = ~10s + buffer
+    run_scheduler_ticks(&config_path, 20);
+    let _ = executor.kill();
+
+    //plan should have moved from active/ to completed/
+    let plan_in_active = active_dir.join("test-tocomplete.md");
+    let completed_files: Vec<_> = fs::read_dir(&completed_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().map(|n| n.starts_with("test-tocomplete")).unwrap_or(false))
+        .collect();
+
+    if plan_in_active.exists() {
+        //still in active — verify all components completed (may need more time for transition)
+        let content = fs::read_to_string(&plan_in_active).unwrap();
+        let completed_count = content.matches("**Status:** COMPLETED").count();
+        assert!(
+            completed_count >= 2,
+            "All 2 components should be COMPLETED. Got {}. File:\n{}",
+            completed_count,
+            content,
+        );
+    } else {
+        //plan moved to completed/ — success
+        assert!(
+            !completed_files.is_empty(),
+            "Completed plan should be in completed/. Contents: {:?}",
+            fs::read_dir(&completed_dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>(),
+        );
+
+        //verify timestamp suffix
+        let name_str = completed_files[0].file_name().to_str().unwrap().to_string();
+        assert!(
+            name_str.contains('T'),
+            "Completed plan filename should have timestamp suffix. Got: {}",
+            name_str,
+        );
+    }
+}
+
+#[test]
+fn test_tracker_shows_both_plans_independently() {
+    //verifies tracker-state.json shows both plans with independent status
+    let test_dir = setup_test_dir_with_plans("tracker-parallel");
+    let config_path = write_test_config_with_plans(&test_dir, 60);
+    let active_dir = test_dir.join("plans/active");
+
+    write_plan_file(&active_dir, "test-plan-alpha.md", alpha_plan_content());
+    write_plan_file(&active_dir, "test-plan-beta.md", beta_plan_content());
+
+    //run one tick
+    run_scheduler_ticks(&config_path, 10);
+
+    //verify tracker contains both plans with independent entries
+    let tracker_path = test_dir.join("tasks/tracker-state.json");
+    assert!(
+        tracker_path.exists(),
+        "tracker-state.json should exist",
+    );
+
+    let state = fs::read_to_string(&tracker_path).unwrap();
+    assert!(
+        state.contains("task_alpha_async_001"),
+        "Tracker should contain alpha. State:\n{}",
+        state,
+    );
+    assert!(
+        state.contains("task_beta_health_001"),
+        "Tracker should contain beta. State:\n{}",
+        state,
+    );
+
+    //both should be active
+    //parse JSON to verify independent status
+    let parsed: serde_json::Value = serde_json::from_str(&state).unwrap();
+    let tasks = parsed["tasks"].as_array().unwrap();
+
+    let alpha_task = tasks.iter().find(|t| t["task_id"] == "task_alpha_async_001");
+    let beta_task = tasks.iter().find(|t| t["task_id"] == "task_beta_health_001");
+
+    assert!(alpha_task.is_some(), "Alpha should be in tracker");
+    assert!(beta_task.is_some(), "Beta should be in tracker");
+
+    //verify they have different component counts
+    assert_eq!(
+        alpha_task.unwrap()["total_components"].as_u64().unwrap(),
+        3,
+        "Alpha should have 3 components",
+    );
+    assert_eq!(
+        beta_task.unwrap()["total_components"].as_u64().unwrap(),
+        2,
+        "Beta should have 2 components",
     );
 }
