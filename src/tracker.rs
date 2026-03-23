@@ -158,6 +158,16 @@ impl TaskTracker {
         }
         self.save_state(&state)
     }
+
+    //mark a task as failed (plan had component failures)
+    pub fn mark_failed(&mut self, task_id: &str) -> anyhow::Result<()> {
+        let mut state = self.load_state();
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.status = "failed".to_string();
+            info!(task_id = %task_id, "task marked as failed");
+        }
+        self.save_state(&state)
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +236,24 @@ mod tests {
         assert!(!tracker.is_tracked("task_persist_001"));
         tracker.track(make_test_task("task_persist_001")).unwrap();
         assert!(tracker.is_tracked("task_persist_001"));
+    }
+
+    #[test]
+    fn test_mark_failed_sets_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = TaskTracker::new(tmp.path().to_path_buf());
+
+        tracker.track(make_test_task("task_fail_001")).unwrap();
+        assert!(tracker.list_active().unwrap().contains(&"task_fail_001".to_string()));
+
+        tracker.mark_failed("task_fail_001").unwrap();
+        //failed tasks should not appear in active list
+        assert!(!tracker.list_active().unwrap().contains(&"task_fail_001".to_string()));
+
+        //verify status is "failed" not "cancelled" or "completed"
+        let state = tracker.load_state();
+        let task = state.tasks.iter().find(|t| t.task_id == "task_fail_001").unwrap();
+        assert_eq!(task.status, "failed");
     }
 
     #[test]

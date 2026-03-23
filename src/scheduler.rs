@@ -278,6 +278,49 @@ fn plan_file_changed(tracker: &TaskTracker, task_id: &str, plan_path: &Path) -> 
     }
 }
 
+//--- Plan lifecycle transitions ---
+
+#[derive(Debug, PartialEq)]
+enum PlanOutcome {
+    Completed,
+    Failed,
+}
+
+//determine whether a finished plan completed successfully or had failures
+fn plan_outcome(task: &TaskFile) -> PlanOutcome {
+    if task.components.iter().any(|c| c.status == ComponentStatus::Failed) {
+        PlanOutcome::Failed
+    } else {
+        PlanOutcome::Completed
+    }
+}
+
+//generate timestamp suffix for plan file moves
+//format: _2026-03-23T2145 (no seconds, avoids colons in filenames)
+fn timestamp_suffix() -> String {
+    chrono::Local::now().format("_%Y-%m-%dT%H%M").to_string()
+}
+
+//move a plan file from source to dest directory with timestamp suffix
+//creates dest directory if needed, returns new path on success
+fn move_plan_file(source: &Path, dest_dir: &Path, filename: &str) -> anyhow::Result<std::path::PathBuf> {
+    fs::create_dir_all(dest_dir)?;
+    let stem = filename.trim_end_matches(".md");
+    let new_name = format!("{}{}.md", stem, timestamp_suffix());
+    let dest = dest_dir.join(&new_name);
+    fs::rename(source, &dest)?;
+    Ok(dest)
+}
+
+//collect details about failed components for logging
+//returns vec of (component_index, title, error_context)
+fn failed_component_details(task: &TaskFile) -> Vec<(usize, String, Option<String>)> {
+    task.components.iter()
+        .filter(|c| c.status == ComponentStatus::Failed)
+        .map(|c| (c.index, c.title.clone(), c.result.clone()))
+        .collect()
+}
+
 impl Scheduler {
     pub fn new(config: Config) -> Self {
         let tracker = TaskTracker::new(config.scheduler.task_queue_dir.clone());
@@ -340,10 +383,13 @@ impl Scheduler {
             warn!(error = %e, "failed to scan active plans");
         }
 
-        //step 4: scan queue dir for new tasks (backward compat)
+        //step 4: transition finished plans from active/ to completed/ or failed/
+        self.transition_finished_plans();
+
+        //step 5: scan queue dir for new tasks (backward compat)
         self.scan_queue().await?;
 
-        //step 5: process all active tasks with checksum-based change detection
+        //step 6: process all active tasks with checksum-based change detection
         let active_tasks = self.tracker.list_active()?;
         for task_ref in &active_tasks {
             if let Err(e) = self.process_task_with_checksum(task_ref).await {
@@ -735,6 +781,110 @@ impl Scheduler {
         #[cfg(not(feature = "kafka"))]
         {
             let _ = (task, component);
+        }
+    }
+
+    //transition finished plans from active/ to completed/ or failed/
+    //called after check_pipeline_completions and scan_active_plans
+    //handles filesystem errors gracefully — logs and continues, never crashes
+    fn transition_finished_plans(&mut self) {
+        let plans_config = match self.config.plans.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        //collect non-cancelled plan filenames to check
+        let candidates: Vec<(String, String)> = self.active_plans.iter()
+            .filter(|(_, state)| !state.cancelled)
+            .map(|(filename, state)| (filename.clone(), state.task_id.clone()))
+            .collect();
+
+        for (filename, task_id) in candidates {
+            let source = plans_config.active_dir.join(&filename);
+            let task = match TaskFile::parse(&source) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        filename = %filename,
+                        error = %e,
+                        "failed to parse plan for transition check"
+                    );
+                    continue;
+                }
+            };
+
+            if !task.is_finished() {
+                continue;
+            }
+
+            let outcome = plan_outcome(&task);
+            let (dest_dir, label) = match outcome {
+                PlanOutcome::Completed => (&plans_config.completed_dir, "completed"),
+                PlanOutcome::Failed => (&plans_config.failed_dir, "failed"),
+            };
+
+            match move_plan_file(&source, dest_dir, &filename) {
+                Ok(new_path) => {
+                    let component_count = task.components.len();
+
+                    match outcome {
+                        PlanOutcome::Completed => {
+                            info!(
+                                task_id = %task_id,
+                                filename = %filename,
+                                components = component_count,
+                                destination = %new_path.display(),
+                                outcome = %label,
+                                "plan completed — moved to completed/"
+                            );
+                        }
+                        PlanOutcome::Failed => {
+                            let failures = failed_component_details(&task);
+                            for (idx, title, result) in &failures {
+                                error!(
+                                    task_id = %task_id,
+                                    filename = %filename,
+                                    failed_component = idx,
+                                    component_title = %title,
+                                    retry_count = 0,
+                                    error_context = ?result,
+                                    "component failed in plan"
+                                );
+                            }
+                            info!(
+                                task_id = %task_id,
+                                filename = %filename,
+                                components = component_count,
+                                failed_count = failures.len(),
+                                destination = %new_path.display(),
+                                outcome = %label,
+                                "plan failed — moved to failed/"
+                            );
+                            //override tracker status to "failed"
+                            if let Err(e) = self.tracker.mark_failed(&task_id) {
+                                warn!(
+                                    task_id = %task_id,
+                                    error = %e,
+                                    "failed to mark plan as failed in tracker"
+                                );
+                            }
+                        }
+                    }
+
+                    //remove from active plans tracking
+                    self.active_plans.remove(&filename);
+                }
+                Err(e) => {
+                    //filesystem error — log and continue, don't crash the loop
+                    error!(
+                        task_id = %task_id,
+                        filename = %filename,
+                        dest_dir = %dest_dir.display(),
+                        error = %e,
+                        "failed to move plan file — will retry next tick"
+                    );
+                }
+            }
         }
     }
 
@@ -1351,6 +1501,168 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(removed2, vec!["existing.md"]);
+    }
+
+    //--- Plan lifecycle transition tests ---
+
+    fn make_component(index: usize, status: ComponentStatus) -> crate::task_parser::Component {
+        crate::task_parser::Component {
+            index,
+            title: format!("Component {}", index),
+            status,
+            agent: Some("test-agent".to_string()),
+            content: "Work.".to_string(),
+            result: None,
+        }
+    }
+
+    fn make_component_with_result(
+        index: usize,
+        status: ComponentStatus,
+        result: Option<&str>,
+    ) -> crate::task_parser::Component {
+        crate::task_parser::Component {
+            index,
+            title: format!("Component {}", index),
+            status,
+            agent: Some("test-agent".to_string()),
+            content: "Work.".to_string(),
+            result: result.map(|s| s.to_string()),
+        }
+    }
+
+    fn make_task_with_components(components: Vec<crate::task_parser::Component>) -> TaskFile {
+        TaskFile {
+            path: String::new(),
+            title: "Test Plan".to_string(),
+            task_id: "task_test_lifecycle".to_string(),
+            components,
+            scheduler_initiated: true,
+        }
+    }
+
+    #[test]
+    fn test_plan_outcome_all_completed() {
+        let task = make_task_with_components(vec![
+            make_component(1, ComponentStatus::Completed),
+            make_component(2, ComponentStatus::Completed),
+            make_component(3, ComponentStatus::Completed),
+        ]);
+        assert_eq!(plan_outcome(&task), PlanOutcome::Completed);
+    }
+
+    #[test]
+    fn test_plan_outcome_with_failure() {
+        let task = make_task_with_components(vec![
+            make_component(1, ComponentStatus::Completed),
+            make_component(2, ComponentStatus::Failed),
+            make_component(3, ComponentStatus::Completed),
+        ]);
+        assert_eq!(plan_outcome(&task), PlanOutcome::Failed);
+    }
+
+    #[test]
+    fn test_plan_outcome_all_failed() {
+        let task = make_task_with_components(vec![
+            make_component(1, ComponentStatus::Failed),
+            make_component(2, ComponentStatus::Failed),
+        ]);
+        assert_eq!(plan_outcome(&task), PlanOutcome::Failed);
+    }
+
+    #[test]
+    fn test_timestamp_suffix_format() {
+        let suffix = timestamp_suffix();
+        //format: _YYYY-MM-DDTHHMM
+        assert!(suffix.starts_with('_'));
+        assert_eq!(suffix.len(), 16); //_2026-03-23T2145
+        assert!(suffix.contains('T'));
+        //no colons (filesystem-safe)
+        assert!(!suffix.contains(':'));
+    }
+
+    #[test]
+    fn test_move_plan_file_success() {
+        let tmp = TempDir::new().unwrap();
+        let active = tmp.path().join("active");
+        let completed = tmp.path().join("completed");
+        fs::create_dir_all(&active).unwrap();
+
+        let source = active.join("my-plan.md");
+        fs::write(&source, "# Plan content").unwrap();
+
+        let result = move_plan_file(&source, &completed, "my-plan.md");
+        assert!(result.is_ok());
+
+        let new_path = result.unwrap();
+        //source should be gone
+        assert!(!source.exists());
+        //dest should exist
+        assert!(new_path.exists());
+        //dest dir created
+        assert!(completed.exists());
+        //filename has timestamp suffix
+        let name = new_path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("my-plan_"));
+        assert!(name.ends_with(".md"));
+        assert!(name.contains('T'));
+        //content preserved
+        let content = fs::read_to_string(&new_path).unwrap();
+        assert_eq!(content, "# Plan content");
+    }
+
+    #[test]
+    fn test_move_plan_file_creates_dest_dir() {
+        let tmp = TempDir::new().unwrap();
+        let active = tmp.path().join("active");
+        let deep_dest = tmp.path().join("a").join("b").join("completed");
+        fs::create_dir_all(&active).unwrap();
+
+        let source = active.join("plan.md");
+        fs::write(&source, "content").unwrap();
+
+        let result = move_plan_file(&source, &deep_dest, "plan.md");
+        assert!(result.is_ok());
+        assert!(deep_dest.exists());
+    }
+
+    #[test]
+    fn test_move_plan_file_nonexistent_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("active").join("ghost.md");
+        let dest = tmp.path().join("completed");
+
+        let result = move_plan_file(&source, &dest, "ghost.md");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_failed_component_details_extracts_failures() {
+        let task = make_task_with_components(vec![
+            make_component(1, ComponentStatus::Completed),
+            make_component_with_result(2, ComponentStatus::Failed, Some("permission denied")),
+            make_component(3, ComponentStatus::Completed),
+            make_component_with_result(4, ComponentStatus::Failed, None),
+        ]);
+
+        let failures = failed_component_details(&task);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].0, 2);
+        assert_eq!(failures[0].1, "Component 2");
+        assert_eq!(failures[0].2, Some("permission denied".to_string()));
+        assert_eq!(failures[1].0, 4);
+        assert_eq!(failures[1].2, None);
+    }
+
+    #[test]
+    fn test_failed_component_details_no_failures() {
+        let task = make_task_with_components(vec![
+            make_component(1, ComponentStatus::Completed),
+            make_component(2, ComponentStatus::Completed),
+        ]);
+
+        let failures = failed_component_details(&task);
+        assert!(failures.is_empty());
     }
 }
 
