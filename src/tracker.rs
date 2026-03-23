@@ -15,6 +15,8 @@ struct TrackedTask {
     total_components: usize,
     completed_components: usize,
     status: String,
+    #[serde(default)]
+    plan_checksum: Option<String>,
 }
 
 pub struct TaskTracker {
@@ -74,6 +76,7 @@ impl TaskTracker {
             total_components: task.components.len(),
             completed_components: completed,
             status: "active".to_string(),
+            plan_checksum: None,
         });
 
         self.save_state(&state)?;
@@ -115,6 +118,23 @@ impl TaskTracker {
                 task.status = "completed".to_string();
                 info!(task_id = %task_id, "task fully completed");
             }
+        }
+        self.save_state(&state)
+    }
+
+    //get the stored checksum for a task's plan file
+    pub fn get_checksum(&self, task_id: &str) -> Option<String> {
+        let state = self.load_state();
+        state.tasks.iter()
+            .find(|t| t.task_id == task_id)
+            .and_then(|t| t.plan_checksum.clone())
+    }
+
+    //store a new checksum for a task's plan file
+    pub fn set_checksum(&mut self, task_id: &str, checksum: &str) -> anyhow::Result<()> {
+        let mut state = self.load_state();
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.plan_checksum = Some(checksum.to_string());
         }
         self.save_state(&state)
     }

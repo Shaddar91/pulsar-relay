@@ -64,4 +64,47 @@ impl ResultConsumer {
             }
         }
     }
+
+    //drain all available results with a short timeout per message
+    pub async fn drain_results(&self) -> anyhow::Result<Vec<ResultMessage>> {
+        let mut results = Vec::new();
+        let mut stream = self.consumer.stream();
+
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.next(),
+            ).await {
+                Ok(Some(Ok(msg))) => {
+                    if let Some(payload) = msg.payload() {
+                        match serde_json::from_slice::<ResultMessage>(payload) {
+                            Ok(result) => {
+                                info!(
+                                    task_id = %result.task_id,
+                                    component = result.component_index,
+                                    status = %result.status,
+                                    "received result from kafka"
+                                );
+                                results.push(result);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize kafka result message");
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    warn!(error = %e, "kafka consumer error during drain");
+                    break;
+                }
+                _ => break, //timeout or stream ended
+            }
+        }
+
+        if !results.is_empty() {
+            info!(count = results.len(), "drained results from kafka");
+        }
+
+        Ok(results)
+    }
 }

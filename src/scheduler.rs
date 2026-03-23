@@ -1,7 +1,10 @@
+use crate::checksum;
 use crate::config::Config;
 use crate::task_parser::{TaskFile, Component, ComponentStatus};
 #[cfg(feature = "kafka")]
 use crate::kafka::producer::TaskProducer;
+#[cfg(feature = "kafka")]
+use crate::kafka::consumer::ResultConsumer;
 use crate::agent::AgentSpawner;
 use crate::tracker::TaskTracker;
 use std::path::Path;
@@ -12,6 +15,10 @@ use fs2::FileExt;
 pub struct Scheduler {
     config: Config,
     tracker: TaskTracker,
+    #[cfg(feature = "kafka")]
+    kafka_producer: Option<TaskProducer>,
+    #[cfg(feature = "kafka")]
+    kafka_consumer: Option<ResultConsumer>,
 }
 
 //write a pipeline task file for a dispatched component
@@ -85,10 +92,43 @@ Component {} of plan "{}": {}
     Ok(filename)
 }
 
+//count completed + failed components
+fn count_done_components(task: &TaskFile) -> usize {
+    task.components.iter()
+        .filter(|c| c.status == ComponentStatus::Completed || c.status == ComponentStatus::Failed)
+        .count()
+}
+
+//check if plan file changed since last known checksum
+fn plan_file_changed(tracker: &TaskTracker, task_id: &str, plan_path: &Path) -> (bool, String) {
+    match checksum::hash_file(plan_path) {
+        Ok(current_hash) => {
+            let stored = tracker.get_checksum(task_id);
+            let changed = stored.as_deref() != Some(&current_hash);
+            (changed, current_hash)
+        }
+        Err(e) => {
+            warn!(task_id = %task_id, error = %e, "failed to hash plan file — treating as changed");
+            (true, String::new())
+        }
+    }
+}
+
 impl Scheduler {
     pub fn new(config: Config) -> Self {
         let tracker = TaskTracker::new(config.scheduler.task_queue_dir.clone());
-        Self { config, tracker }
+
+        #[cfg(feature = "kafka")]
+        let (kafka_producer, kafka_consumer) = init_kafka(&config);
+
+        Self {
+            config,
+            tracker,
+            #[cfg(feature = "kafka")]
+            kafka_producer,
+            #[cfg(feature = "kafka")]
+            kafka_consumer,
+        }
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -110,7 +150,7 @@ impl Scheduler {
     }
 
     async fn tick(&mut self) -> anyhow::Result<()> {
-        //acquire lock - if another instance is running, skip
+        //acquire lock — if another instance is running, skip
         let lock_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -122,24 +162,97 @@ impl Scheduler {
             return Ok(());
         }
 
-        info!("tick started — scanning for tasks");
+        info!("tick started");
 
-        //load active tasks from tracker
-        let active_tasks = self.tracker.list_active()?;
+        //step 1: consume any completed results from kafka
+        self.consume_kafka_results().await;
 
-        for task_ref in &active_tasks {
-            self.process_task(task_ref).await?;
-        }
-
-        //scan for new tasks in queue directory
+        //step 2: scan queue dir for new tasks (adds them to tracker)
         self.scan_queue().await?;
 
-        //release lock (dropped when lock_file goes out of scope)
+        //step 3: process all active tasks with checksum-based change detection
+        let active_tasks = self.tracker.list_active()?;
+        for task_ref in &active_tasks {
+            if let Err(e) = self.process_task_with_checksum(task_ref).await {
+                error!(task_id = %task_ref, error = %e, "failed to process task");
+            }
+        }
+
+        //release lock
         drop(lock_file);
 
+        info!(active_tasks = active_tasks.len(), "tick completed");
+        Ok(())
+    }
+
+    //consume completed results from kafka and apply to plan files
+    async fn consume_kafka_results(&mut self) {
+        #[cfg(feature = "kafka")]
+        {
+            if let Some(ref consumer) = self.kafka_consumer {
+                match consumer.drain_results().await {
+                    Ok(results) => {
+                        for result in results {
+                            if let Err(e) = self.apply_kafka_result(
+                                &result.task_id,
+                                result.component_index,
+                                &result.status,
+                                result.output.as_deref(),
+                            ) {
+                                error!(
+                                    task_id = %result.task_id,
+                                    component = result.component_index,
+                                    error = %e,
+                                    "failed to apply kafka result"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to drain kafka results");
+                    }
+                }
+            }
+        }
+    }
+
+    //apply a single result from kafka to the plan file
+    #[cfg(feature = "kafka")]
+    fn apply_kafka_result(
+        &mut self,
+        task_id: &str,
+        component_index: usize,
+        status: &str,
+        output: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let task_path = self.tracker.get_task_path(task_id)?;
+        let path = Path::new(&task_path);
+
+        let new_status = match status.to_uppercase().as_str() {
+            "COMPLETED" => ComponentStatus::Completed,
+            "FAILED" => ComponentStatus::Failed,
+            other => {
+                warn!(status = %other, "unknown kafka result status, skipping");
+                return Ok(());
+            }
+        };
+
+        TaskFile::update_component_status(path, component_index, new_status, output)?;
+
+        if let Err(e) = TaskFile::update_plan_header(path) {
+            warn!(error = %e, "failed to update plan header after kafka result");
+        }
+
+        //update tracker progress
+        let task = TaskFile::parse(path)?;
+        let done = count_done_components(&task);
+        self.tracker.update_progress(task_id, done)?;
+
         info!(
-            active_tasks = active_tasks.len(),
-            "tick completed"
+            task_id = %task_id,
+            component = component_index,
+            status = %status,
+            "applied kafka result to plan"
         );
 
         Ok(())
@@ -169,57 +282,87 @@ impl Scheduler {
         Ok(())
     }
 
+    //ingest a new task: track it, optionally publish to kafka
+    //does NOT dispatch — the main loop handles that via process_task_with_checksum
     async fn ingest_task(&mut self, path: &Path) -> anyhow::Result<()> {
         let task = TaskFile::parse(path)?;
 
         if task.is_finished() {
-            info!(task_id = %task.task_id, "task already finished, skipping");
             return Ok(());
         }
 
-        if !self.tracker.is_tracked(&task.task_id) {
-            info!(
-                task_id = %task.task_id,
-                components = task.components.len(),
-                "ingesting new task"
-            );
-            self.tracker.track(task.clone())?;
+        if self.tracker.is_tracked(&task.task_id) {
+            return Ok(());
+        }
 
-            //produce component chunks to Kafka if enabled
-            #[cfg(feature = "kafka")]
-            if let Some(ref kafka_config) = self.config.kafka {
-                if let Ok(producer) = TaskProducer::new(kafka_config) {
-                    for component in &task.components {
-                        if component.status == ComponentStatus::Pending {
-                            if let Err(e) = producer.send_component(&task.task_id, component).await {
-                                warn!(error = %e, "failed to enqueue component to kafka");
-                            }
+        info!(
+            task_id = %task.task_id,
+            components = task.components.len(),
+            "ingesting new task from queue"
+        );
+        self.tracker.track(task.clone())?;
+
+        //publish pending components to kafka if available
+        #[cfg(feature = "kafka")]
+        {
+            if let Some(ref producer) = self.kafka_producer {
+                let hash = checksum::hash_file(path).unwrap_or_default();
+                for component in &task.components {
+                    if component.status == ComponentStatus::Pending {
+                        if let Err(e) = producer.send_dispatch(
+                            &task.task_id,
+                            component,
+                            &task.path,
+                            &hash,
+                        ).await {
+                            warn!(error = %e, "failed to enqueue component to kafka");
                         }
                     }
-                } else {
-                    warn!("kafka unavailable — operating in local-only mode");
                 }
             }
         }
 
-        //process the next pending component
-        self.process_task_file(&task).await
+        Ok(())
     }
 
-    async fn process_task(&mut self, task_ref: &str) -> anyhow::Result<()> {
+    //process an active task with checksum-based change detection
+    //skips if plan file hasn't changed since last tick
+    async fn process_task_with_checksum(&mut self, task_ref: &str) -> anyhow::Result<()> {
         let task_path = self.tracker.get_task_path(task_ref)?;
-        let task = TaskFile::parse(Path::new(&task_path))?;
+        let path = Path::new(&task_path);
 
-        self.process_task_file(&task).await
+        if !path.exists() {
+            warn!(task_id = %task_ref, path = %task_path, "plan file not found, skipping");
+            return Ok(());
+        }
+
+        //compute current checksum and compare with stored
+        let (changed, _current_hash) = plan_file_changed(&self.tracker, task_ref, path);
+
+        if !changed {
+            info!(task_id = %task_ref, "plan unchanged since last tick, skipping");
+            return Ok(());
+        }
+
+        //plan is new (no stored hash) or changed — re-evaluate
+        info!(task_id = %task_ref, "plan changed or new — evaluating components");
+
+        let task = TaskFile::parse(path)?;
+        self.dispatch_next_component(&task).await?;
+
+        //store new checksum AFTER dispatch (dispatch modifies the plan file)
+        if let Ok(new_hash) = checksum::hash_file(path) {
+            self.tracker.set_checksum(task_ref, &new_hash)?;
+        }
+
+        Ok(())
     }
 
-    async fn process_task_file(&mut self, task: &TaskFile) -> anyhow::Result<()> {
-        //check if something is already in progress
+    //dispatch the next pending component via filesystem + kafka
+    async fn dispatch_next_component(&mut self, task: &TaskFile) -> anyhow::Result<()> {
+        //strict sequential: skip if any component is currently in progress
         if task.has_in_progress() {
-            info!(
-                task_id = %task.task_id,
-                "component still in progress, waiting"
-            );
+            info!(task_id = %task.task_id, "component still in progress, waiting");
             return Ok(());
         }
 
@@ -229,7 +372,6 @@ impl Scheduler {
             None => {
                 if task.is_finished() {
                     info!(task_id = %task.task_id, "all components finished");
-                    //update plan header to reflect completion
                     if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
                         warn!(error = %e, "failed to update plan header");
                     }
@@ -243,10 +385,10 @@ impl Scheduler {
             component = component.index,
             title = %component.title,
             agent = ?component.agent,
-            "dispatching component to agent"
+            "dispatching component"
         );
 
-        //write pipeline task file for tracking/labeling
+        //1. write pipeline task file (filesystem dispatch)
         if let Err(e) = write_pipeline_task(
             &self.config.scheduler.pipeline_ready_dir,
             task,
@@ -255,7 +397,10 @@ impl Scheduler {
             warn!(error = %e, "failed to write pipeline task file (non-fatal)");
         }
 
-        //mark component as in-progress
+        //2. publish to kafka (non-fatal — filesystem is fallback)
+        self.publish_dispatch_to_kafka(task, component).await;
+
+        //3. mark component as in-progress
         TaskFile::update_component_status(
             Path::new(&task.path),
             component.index,
@@ -263,16 +408,14 @@ impl Scheduler {
             None,
         )?;
 
-        //update plan header to show progress
         if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
             warn!(error = %e, "failed to update plan header");
         }
 
-        //spawn agent to work on this component
-        let agent_name = component.agent.as_deref()
-            .unwrap_or("backend-developer");
-
+        //4. spawn agent to work on this component
+        let agent_name = component.agent.as_deref().unwrap_or("backend-developer");
         let spawner = AgentSpawner::new(&self.config.agent);
+
         match spawner.spawn(agent_name, &task.path, component.index).await {
             Ok(result) => {
                 info!(
@@ -303,18 +446,79 @@ impl Scheduler {
             }
         }
 
-        //update plan header after component completion
+        //5. update plan header and tracker
         if let Err(e) = TaskFile::update_plan_header(Path::new(&task.path)) {
             warn!(error = %e, "failed to update plan header");
         }
 
-        //update tracker progress by re-parsing the file
         let updated_task = TaskFile::parse(Path::new(&task.path))?;
-        let completed = updated_task.components.iter()
-            .filter(|c| c.status == ComponentStatus::Completed || c.status == ComponentStatus::Failed)
-            .count();
-        self.tracker.update_progress(&task.task_id, completed)?;
+        let done = count_done_components(&updated_task);
+        self.tracker.update_progress(&task.task_id, done)?;
 
         Ok(())
+    }
+
+    //publish a component dispatch to kafka (non-fatal)
+    async fn publish_dispatch_to_kafka(&self, task: &TaskFile, component: &Component) {
+        #[cfg(feature = "kafka")]
+        {
+            if let Some(ref producer) = self.kafka_producer {
+                let hash = checksum::hash_file(Path::new(&task.path)).unwrap_or_default();
+                if let Err(e) = producer.send_dispatch(
+                    &task.task_id,
+                    component,
+                    &task.path,
+                    &hash,
+                ).await {
+                    warn!(
+                        task_id = %task.task_id,
+                        component = component.index,
+                        error = %e,
+                        "kafka dispatch failed — filesystem fallback active"
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(feature = "kafka"))]
+        {
+            let _ = (task, component);
+        }
+    }
+}
+
+//initialize kafka producer and consumer from config (non-fatal on failure)
+#[cfg(feature = "kafka")]
+fn init_kafka(config: &Config) -> (Option<TaskProducer>, Option<ResultConsumer>) {
+    match config.kafka.as_ref() {
+        Some(kafka_config) => {
+            let producer = match TaskProducer::new(kafka_config) {
+                Ok(p) => {
+                    info!("kafka producer initialized");
+                    Some(p)
+                }
+                Err(e) => {
+                    warn!(error = %e, "kafka producer init failed — filesystem-only mode");
+                    None
+                }
+            };
+
+            let consumer = match ResultConsumer::new(kafka_config) {
+                Ok(c) => {
+                    info!("kafka result consumer initialized");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!(error = %e, "kafka consumer init failed — no result polling");
+                    None
+                }
+            };
+
+            (producer, consumer)
+        }
+        None => {
+            info!("no kafka config — operating in filesystem-only mode");
+            (None, None)
+        }
     }
 }

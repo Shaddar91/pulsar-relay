@@ -5,23 +5,28 @@ use std::path::Path;
 use tracing::{info, warn};
 
 //ingest a plan file or folder of plans into the scheduler
-pub fn ingest_path(
+pub async fn ingest_path(
     path: &Path,
     config: &Config,
     tracker: &mut TaskTracker,
 ) -> anyhow::Result<Vec<String>> {
     if path.is_file() {
-        let id = ingest_file(path, tracker)?;
+        let id = ingest_file(path, config, tracker).await?;
         Ok(vec![id])
     } else if path.is_dir() {
-        ingest_folder(path, config, tracker)
+        ingest_folder(path, config, tracker).await
     } else {
         Err(anyhow::anyhow!("path does not exist: {}", path.display()))
     }
 }
 
-//ingest a single plan file — validate and register with tracker
-fn ingest_file(path: &Path, tracker: &mut TaskTracker) -> anyhow::Result<String> {
+//ingest a single plan file — validate, register with tracker, publish to kafka
+//note: checksum is NOT stored here — the scheduler sets it after processing
+pub async fn ingest_file(
+    path: &Path,
+    config: &Config,
+    tracker: &mut TaskTracker,
+) -> anyhow::Result<String> {
     let abs_path = std::fs::canonicalize(path)
         .map_err(|e| anyhow::anyhow!("cannot resolve path {}: {}", path.display(), e))?;
 
@@ -59,13 +64,70 @@ fn ingest_file(path: &Path, tracker: &mut TaskTracker) -> anyhow::Result<String>
     );
 
     tracker.track(task.clone())?;
+
+    //publish pending components to kafka if available (non-fatal)
+    publish_to_kafka_if_available(config, &task, &abs_path).await;
+
     Ok(task.task_id)
 }
 
+//publish pending components to kafka (non-fatal on failure)
+async fn publish_to_kafka_if_available(
+    config: &Config,
+    task: &TaskFile,
+    plan_path: &Path,
+) {
+    #[cfg(feature = "kafka")]
+    {
+        use crate::task_parser::ComponentStatus;
+        use crate::checksum;
+
+        if let Some(ref kafka_config) = config.kafka {
+            match crate::kafka::producer::TaskProducer::new(kafka_config) {
+                Ok(producer) => {
+                    let hash = checksum::hash_file(plan_path).unwrap_or_default();
+                    let pending: Vec<_> = task.components.iter()
+                        .filter(|c| c.status == ComponentStatus::Pending)
+                        .collect();
+
+                    for component in &pending {
+                        if let Err(e) = producer.send_dispatch(
+                            &task.task_id,
+                            component,
+                            &plan_path.to_string_lossy(),
+                            &hash,
+                        ).await {
+                            warn!(
+                                task_id = %task.task_id,
+                                component = component.index,
+                                error = %e,
+                                "failed to publish component to kafka (non-fatal)"
+                            );
+                        }
+                    }
+                    info!(
+                        task_id = %task.task_id,
+                        count = pending.len(),
+                        "published pending components to kafka"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "kafka unavailable — operating in local-only mode");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "kafka"))]
+    {
+        let _ = (config, task, plan_path);
+    }
+}
+
 //ingest all .md files in a folder
-fn ingest_folder(
+async fn ingest_folder(
     path: &Path,
-    _config: &Config,
+    config: &Config,
     tracker: &mut TaskTracker,
 ) -> anyhow::Result<Vec<String>> {
     let mut ids = Vec::new();
@@ -79,7 +141,7 @@ fn ingest_folder(
 
     for entry in entries {
         let file_path = entry.path();
-        match ingest_file(&file_path, tracker) {
+        match ingest_file(&file_path, config, tracker).await {
             Ok(id) => {
                 info!(task_id = %id, file = %file_path.display(), "plan ingested");
                 ids.push(id);
@@ -128,34 +190,71 @@ Do another thing.
         TaskTracker::new(dir.to_path_buf())
     }
 
-    #[test]
-    fn test_ingest_single_file() {
+    fn test_config(tmp_dir: &Path) -> Config {
+        Config {
+            scheduler: crate::config::SchedulerConfig {
+                interval_secs: 60,
+                pipeline_ready_dir: tmp_dir.join("ready"),
+                pipeline_processing_dir: tmp_dir.join("processing"),
+                pipeline_completed_dir: tmp_dir.join("completed"),
+                task_queue_dir: tmp_dir.join("tasks"),
+                lock_file: tmp_dir.join("lock"),
+            },
+            kafka: None,
+            agent: crate::config::AgentConfig {
+                spawn_script: "/dev/null".into(),
+                default_model: "sonnet".into(),
+                component_timeout_secs: 30,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ingest_single_file() {
         let tmp_dir = TempDir::new().unwrap();
         let mut tracker = make_tracker(tmp_dir.path());
+        let config = test_config(tmp_dir.path());
 
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(sample_plan().as_bytes()).unwrap();
 
-        let result = ingest_file(f.path(), &mut tracker);
+        let result = ingest_file(f.path(), &config, &mut tracker).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "task_ingest_test_001");
         assert!(tracker.is_tracked("task_ingest_test_001"));
     }
 
-    #[test]
-    fn test_ingest_rejects_empty_plan() {
+    #[tokio::test]
+    async fn test_ingest_no_checksum_stored() {
+        //checksum is NOT set during ingestion — scheduler owns that
         let tmp_dir = TempDir::new().unwrap();
         let mut tracker = make_tracker(tmp_dir.path());
+        let config = test_config(tmp_dir.path());
+
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(sample_plan().as_bytes()).unwrap();
+
+        ingest_file(f.path(), &config, &mut tracker).await.unwrap();
+
+        let checksum = tracker.get_checksum("task_ingest_test_001");
+        assert!(checksum.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_rejects_empty_plan() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut tracker = make_tracker(tmp_dir.path());
+        let config = test_config(tmp_dir.path());
 
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"# Empty Plan\n\n**Task ID:** task_empty\n\nNo components here.\n").unwrap();
 
-        let result = ingest_file(f.path(), &mut tracker);
+        let result = ingest_file(f.path(), &config, &mut tracker).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_ingest_folder() {
+    #[tokio::test]
+    async fn test_ingest_folder() {
         let tmp_dir = TempDir::new().unwrap();
         let plans_dir = tmp_dir.path().join("plans");
         std::fs::create_dir_all(&plans_dir).unwrap();
@@ -164,7 +263,23 @@ Do another thing.
         std::fs::create_dir_all(&tracker_dir).unwrap();
         let mut tracker = make_tracker(&tracker_dir);
 
-        //create two plan files
+        let config = Config {
+            scheduler: crate::config::SchedulerConfig {
+                interval_secs: 60,
+                pipeline_ready_dir: tmp_dir.path().join("ready"),
+                pipeline_processing_dir: tmp_dir.path().join("processing"),
+                pipeline_completed_dir: tmp_dir.path().join("completed"),
+                task_queue_dir: tracker_dir.clone(),
+                lock_file: tmp_dir.path().join("lock"),
+            },
+            kafka: None,
+            agent: crate::config::AgentConfig {
+                spawn_script: "/dev/null".into(),
+                default_model: "sonnet".into(),
+                component_timeout_secs: 30,
+            },
+        };
+
         std::fs::write(
             plans_dir.join("plan-a.md"),
             r#"# Plan A
@@ -199,27 +314,10 @@ More work.
 "#,
         ).unwrap();
 
-        //also a non-md file (should be ignored)
+        //non-md file (should be ignored)
         std::fs::write(plans_dir.join("notes.txt"), "ignore me").unwrap();
 
-        let config = crate::config::Config {
-            scheduler: crate::config::SchedulerConfig {
-                interval_secs: 60,
-                pipeline_ready_dir: tmp_dir.path().join("ready"),
-                pipeline_processing_dir: tmp_dir.path().join("processing"),
-                pipeline_completed_dir: tmp_dir.path().join("completed"),
-                task_queue_dir: tracker_dir.clone(),
-                lock_file: tmp_dir.path().join("lock"),
-            },
-            kafka: None,
-            agent: crate::config::AgentConfig {
-                spawn_script: "/dev/null".into(),
-                default_model: "sonnet".into(),
-                component_timeout_secs: 30,
-            },
-        };
-
-        let result = ingest_folder(&plans_dir, &config, &mut tracker);
+        let result = ingest_folder(&plans_dir, &config, &mut tracker).await;
         assert!(result.is_ok());
         let ids = result.unwrap();
         assert_eq!(ids.len(), 2);
@@ -227,25 +325,25 @@ More work.
         assert!(tracker.is_tracked("task_folder_b"));
     }
 
-    #[test]
-    fn test_ingest_skips_already_tracked() {
+    #[tokio::test]
+    async fn test_ingest_skips_already_tracked() {
         let tmp_dir = TempDir::new().unwrap();
         let mut tracker = make_tracker(tmp_dir.path());
+        let config = test_config(tmp_dir.path());
 
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(sample_plan().as_bytes()).unwrap();
 
-        //ingest once
-        ingest_file(f.path(), &mut tracker).unwrap();
-        //ingest again — should not error
-        let result = ingest_file(f.path(), &mut tracker);
+        ingest_file(f.path(), &config, &mut tracker).await.unwrap();
+        let result = ingest_file(f.path(), &config, &mut tracker).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_ingest_skips_finished_plan() {
+    #[tokio::test]
+    async fn test_ingest_skips_finished_plan() {
         let tmp_dir = TempDir::new().unwrap();
         let mut tracker = make_tracker(tmp_dir.path());
+        let config = test_config(tmp_dir.path());
 
         let content = r#"# Finished Plan
 **Task ID:** task_done
@@ -259,9 +357,8 @@ More work.
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
 
-        let result = ingest_file(f.path(), &mut tracker);
+        let result = ingest_file(f.path(), &config, &mut tracker).await;
         assert!(result.is_ok());
-        //should not be tracked because it's already finished
         assert!(!tracker.is_tracked("task_done"));
     }
 }

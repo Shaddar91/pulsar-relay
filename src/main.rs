@@ -6,6 +6,7 @@ mod kafka;
 mod agent;
 mod tracker;
 mod ingest;
+mod checksum;
 
 use std::path::PathBuf;
 use tracing::{info, error};
@@ -65,7 +66,7 @@ async fn run_ingest(ingest_path: PathBuf, config_path: PathBuf) -> anyhow::Resul
     std::fs::create_dir_all(&cfg.scheduler.task_queue_dir)?;
 
     let mut tracker = tracker::TaskTracker::new(cfg.scheduler.task_queue_dir.clone());
-    let ids = ingest::ingest_path(&ingest_path, &cfg, &mut tracker)?;
+    let ids = ingest::ingest_path(&ingest_path, &cfg, &mut tracker).await?;
 
     for id in &ids {
         info!(task_id = %id, "plan registered with scheduler");
