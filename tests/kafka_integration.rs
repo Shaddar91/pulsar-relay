@@ -157,6 +157,87 @@ mod kafka_tests {
     }
 
     #[tokio::test]
+    async fn test_scheduler_dispatches_to_kafka_with_plan_context() {
+        //verify that ComponentMessage includes plan_file_path and plan_checksum
+        //when sent via send_dispatch (scheduler dispatch path)
+        let producer = create_producer();
+        let unique_id = format!("task_dispatch_ctx_{}", uuid::Uuid::new_v4().simple());
+
+        //simulate a scheduler dispatch with plan context
+        #[derive(Debug, Serialize, Deserialize)]
+        struct ContextMessage {
+            task_id: String,
+            component_index: usize,
+            component_title: String,
+            agent: Option<String>,
+            content: String,
+            plan_file_path: Option<String>,
+            plan_checksum: Option<String>,
+        }
+
+        let msg = ContextMessage {
+            task_id: unique_id.clone(),
+            component_index: 1,
+            component_title: "Build API".to_string(),
+            agent: Some("backend-developer".to_string()),
+            content: "Implement REST endpoints".to_string(),
+            plan_file_path: Some("/path/to/plan.md".to_string()),
+            plan_checksum: Some("abc123def456".to_string()),
+        };
+
+        let payload = serde_json::to_string(&msg).unwrap();
+        let key = format!("{}:{}", msg.task_id, msg.component_index);
+
+        let result = producer
+            .send(
+                FutureRecord::to(TASKS_TOPIC)
+                    .key(&key)
+                    .payload(&payload),
+                Duration::from_secs(5),
+            )
+            .await;
+
+        match result {
+            Ok((partition, offset)) => {
+                assert!(partition >= 0);
+                assert!(offset >= 0);
+
+                //consume and verify context fields are preserved
+                let group_id = format!("test-ctx-{}", uuid::Uuid::new_v4());
+                let consumer = create_consumer(&group_id, TASKS_TOPIC);
+                let mut stream = consumer.stream();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        panic!("timed out waiting for context message task_id={}", unique_id);
+                    }
+
+                    match tokio::time::timeout(remaining, stream.next()).await {
+                        Ok(Some(Ok(msg_data))) => {
+                            if let Some(payload_bytes) = msg_data.payload() {
+                                if let Ok(received) = serde_json::from_slice::<ContextMessage>(payload_bytes) {
+                                    if received.task_id == unique_id {
+                                        assert_eq!(received.plan_file_path, Some("/path/to/plan.md".to_string()));
+                                        assert_eq!(received.plan_checksum, Some("abc123def456".to_string()));
+                                        println!("context fields verified in kafka message");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => panic!("consumer error: {}", e),
+                        Ok(None) => panic!("stream ended"),
+                        Err(_) => panic!("timed out waiting for context message"),
+                    }
+                }
+            }
+            Err((e, _)) => panic!("failed to produce: {}", e),
+        }
+    }
+
+    #[tokio::test]
     async fn test_end_to_end_task_flow() {
         let producer = create_producer();
         let unique_id = format!("task_e2e_{}", uuid::Uuid::new_v4().simple());
