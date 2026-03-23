@@ -73,6 +73,33 @@ src/
 - Each module (`scheduler.rs`, `task_parser.rs`, etc.) should expose a clean public API of composable functions
 - No "random shit code" — every function should be testable in isolation
 
+## Plan Naming & Location
+
+**Plans live in Forge (Obsidian):**
+```
+forge/projects/pulsar-relay/plans/
+├── drafts/     # write/refine here, no execution
+├── active/     # move here = "go", scheduler watches this
+├── completed/  # scheduler moves done plans here
+└── failed/     # scheduler moves failed plans here
+```
+
+**Plan file naming rules:**
+- File name MUST describe what the plan does: `aw-dashboard-stage-testing.md`, `kafka-checksum-integration.md`
+- NEVER use generic names like `implementation-plan.md`, `plan.md`, `task.md`
+- The `# Title` in the plan must also be descriptive — this shows up in vps-status and logs
+- Task ID should reflect the plan name: `task_aw_dashboard_stage_001`, not `task_001`
+
+**Plan file header must include:**
+```markdown
+# Descriptive Plan Title
+**Task ID:** task_descriptive_name_001
+**Scheduler:** pulsar-relay
+**Project:** [[project-name]]
+```
+
+**Forge implementation plan** (`tasks/implementation-plan.md`) is the project-level overview doc — NOT a plan for the scheduler. Don't confuse the two.
+
 ## Agent Execution Permissions
 
 Agents are authorized to:

@@ -201,6 +201,7 @@ Do another thing.
                 lock_file: tmp_dir.join("lock"),
             },
             kafka: None,
+            plans: None,
             agent: crate::config::AgentConfig {
                 spawn_script: "/dev/null".into(),
                 default_model: "sonnet".into(),
@@ -273,6 +274,7 @@ Do another thing.
                 lock_file: tmp_dir.path().join("lock"),
             },
             kafka: None,
+            plans: None,
             agent: crate::config::AgentConfig {
                 spawn_script: "/dev/null".into(),
                 default_model: "sonnet".into(),

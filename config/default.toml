@@ -18,6 +18,13 @@ task_topic = "pulsar.tasks"
 result_topic = "pulsar.results"
 group_id = "pulsar-relay-scheduler"
 
+[plans]
+#plan lifecycle directories — env var overrides: PULSAR_PLANS_DRAFTS_DIR, etc.
+drafts_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/drafts"
+active_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/active"
+completed_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/completed"
+failed_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/failed"
+
 [agent]
 #path to spawn-agent-v2.sh
 spawn_script = "/home/shaddar/Documents/workspace/ai-task-automation/scripts/spawn-agent-v2.sh"

@@ -138,4 +138,105 @@ impl TaskTracker {
         }
         self.save_state(&state)
     }
+
+    //mark a task as cancelled (plan removed from active directory)
+    pub fn mark_cancelled(&mut self, task_id: &str) -> anyhow::Result<()> {
+        let mut state = self.load_state();
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.status = "cancelled".to_string();
+            info!(task_id = %task_id, "task marked as cancelled");
+        }
+        self.save_state(&state)
+    }
+
+    //reactivate a cancelled task (plan reappeared in active directory)
+    pub fn reactivate(&mut self, task_id: &str) -> anyhow::Result<()> {
+        let mut state = self.load_state();
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.status = "active".to_string();
+            info!(task_id = %task_id, "task reactivated");
+        }
+        self.save_state(&state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_task(task_id: &str) -> crate::task_parser::TaskFile {
+        crate::task_parser::TaskFile {
+            path: "/tmp/test.md".to_string(),
+            title: "Test".to_string(),
+            task_id: task_id.to_string(),
+            components: vec![crate::task_parser::Component {
+                index: 1,
+                title: "Step".to_string(),
+                status: crate::task_parser::ComponentStatus::Pending,
+                agent: None,
+                content: "Work.".to_string(),
+                result: None,
+            }],
+            scheduler_initiated: true,
+        }
+    }
+
+    #[test]
+    fn test_track_and_list_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = TaskTracker::new(tmp.path().to_path_buf());
+
+        let task = make_test_task("task_track_001");
+        tracker.track(task).unwrap();
+
+        let active = tracker.list_active().unwrap();
+        assert!(active.contains(&"task_track_001".to_string()));
+    }
+
+    #[test]
+    fn test_mark_cancelled_removes_from_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = TaskTracker::new(tmp.path().to_path_buf());
+
+        tracker.track(make_test_task("task_cancel_001")).unwrap();
+        assert!(tracker.list_active().unwrap().contains(&"task_cancel_001".to_string()));
+
+        tracker.mark_cancelled("task_cancel_001").unwrap();
+        assert!(!tracker.list_active().unwrap().contains(&"task_cancel_001".to_string()));
+    }
+
+    #[test]
+    fn test_reactivate_after_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = TaskTracker::new(tmp.path().to_path_buf());
+
+        tracker.track(make_test_task("task_react_001")).unwrap();
+        tracker.mark_cancelled("task_react_001").unwrap();
+        assert!(!tracker.list_active().unwrap().contains(&"task_react_001".to_string()));
+
+        tracker.reactivate("task_react_001").unwrap();
+        assert!(tracker.list_active().unwrap().contains(&"task_react_001".to_string()));
+    }
+
+    #[test]
+    fn test_is_tracked_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = TaskTracker::new(tmp.path().to_path_buf());
+
+        assert!(!tracker.is_tracked("task_persist_001"));
+        tracker.track(make_test_task("task_persist_001")).unwrap();
+        assert!(tracker.is_tracked("task_persist_001"));
+    }
+
+    #[test]
+    fn test_checksum_operations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = TaskTracker::new(tmp.path().to_path_buf());
+
+        tracker.track(make_test_task("task_cksum_001")).unwrap();
+        assert!(tracker.get_checksum("task_cksum_001").is_none());
+
+        tracker.set_checksum("task_cksum_001", "abc123").unwrap();
+        assert_eq!(tracker.get_checksum("task_cksum_001").unwrap(), "abc123");
+    }
 }
