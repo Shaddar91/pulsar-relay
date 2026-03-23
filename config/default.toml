@@ -1,14 +1,14 @@
 [scheduler]
 #interval in seconds (900 = 15 minutes)
-interval_secs = 900
+interval_secs = 60
 #path to AI task automation pipeline ready directory
-pipeline_ready_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/pipeline/ready"
+pipeline_ready_dir = "${AI_PROJECT_ROOT}/data/pipeline/ready"
 #path to pipeline processing directory
-pipeline_processing_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/pipeline/processing"
+pipeline_processing_dir = "${AI_PROJECT_ROOT}/data/pipeline/processing"
 #path to pipeline completed directory
-pipeline_completed_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/pipeline/completed"
+pipeline_completed_dir = "${AI_PROJECT_ROOT}/data/pipeline/completed"
 #path to scheduler's own task queue
-task_queue_dir = "/home/shaddar/Documents/workspace/personal/projects/pulsar-relay/data/tasks"
+task_queue_dir = "${PULSAR_RELAY_DIR}/data/tasks"
 #lock file path
 lock_file = "/tmp/pulsar-relay.lock"
 
@@ -19,15 +19,16 @@ result_topic = "pulsar.results"
 group_id = "pulsar-relay-scheduler"
 
 [plans]
-#plan lifecycle directories — env var overrides: PULSAR_PLANS_DRAFTS_DIR, etc.
-drafts_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/drafts"
-active_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/active"
-completed_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/completed"
-failed_dir = "/home/shaddar/Documents/workspace/ai-task-automation/data/plans/failed"
+#plan lifecycle directories — Forge/Obsidian is source of truth for visual overview
+#env var overrides: PULSAR_PLANS_DRAFTS_DIR, etc.
+drafts_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/drafts"
+active_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/active"
+completed_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/completed"
+failed_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/failed"
 
 [agent]
 #path to spawn-agent-v2.sh
-spawn_script = "/home/shaddar/Documents/workspace/ai-task-automation/scripts/spawn-agent-v2.sh"
+spawn_script = "${AI_PROJECT_ROOT}/scripts/spawn-agent-v2.sh"
 #default model for spawned agents
 default_model = "sonnet"
 #timeout per component in seconds (30 min)
