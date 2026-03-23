@@ -407,7 +407,7 @@ fn test_pipeline_task_has_scheduler_label() {
     let test_dir = setup_test_dir("pipeline-label");
     let config_path = write_test_config(&test_dir, 2);
     let tasks_dir = test_dir.join("tasks");
-    let pipeline_ready = test_dir.join("pipeline/ready");
+    let _pipeline_ready = test_dir.join("pipeline/ready");
 
     let task_content = r#"# Pipeline Label Test
 
