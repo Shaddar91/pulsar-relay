@@ -10,6 +10,8 @@ pub struct Config {
     pub kafka: Option<KafkaConfig>,
     #[serde(default)]
     pub plans: Option<PlansConfig>,
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
     pub agent: AgentConfig,
 }
 
@@ -46,6 +48,43 @@ pub struct AgentConfig {
     pub spawn_script: PathBuf,
     pub default_model: String,
     pub component_timeout_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_bot_token_env")]
+    pub bot_token_env: String,
+    #[serde(default = "default_chat_id_env")]
+    pub chat_id_env: String,
+    #[serde(default)]
+    pub notify_plan_completed: bool,
+    #[serde(default)]
+    pub notify_plan_failed: bool,
+    #[serde(default)]
+    pub notify_component_completed: bool,
+}
+
+fn default_bot_token_env() -> String {
+    "TELEGRAM_BOT_TOKEN".to_string()
+}
+
+fn default_chat_id_env() -> String {
+    "TELEGRAM_OWNER_ID".to_string()
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_env: default_bot_token_env(),
+            chat_id_env: default_chat_id_env(),
+            notify_plan_completed: false,
+            notify_plan_failed: false,
+            notify_component_completed: false,
+        }
+    }
 }
 
 //Expand ${VAR} patterns in a path using env vars.
@@ -315,5 +354,84 @@ failed_dir = "/toml/failed"
         let result = expand_path(PathBuf::from(format!("${{{}}}/foo", var_name)));
         assert_eq!(result, PathBuf::from("/foo"));
         std::env::remove_var(&var_name);
+    }
+
+    //--- TelegramConfig tests ---
+
+    #[test]
+    #[serial]
+    fn test_config_missing_telegram_section_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_toml(tmp.path(), minimal_toml());
+
+        std::env::remove_var("PULSAR_PLANS_DRAFTS_DIR");
+        std::env::remove_var("PULSAR_PLANS_ACTIVE_DIR");
+        std::env::remove_var("PULSAR_PLANS_COMPLETED_DIR");
+        std::env::remove_var("PULSAR_PLANS_FAILED_DIR");
+
+        let config = Config::load(&path).unwrap();
+        assert!(config.telegram.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_with_telegram_section_parses() {
+        let toml_content = format!(
+            r#"{}
+[telegram]
+enabled = true
+bot_token_env = "MY_BOT_TOKEN"
+chat_id_env = "MY_CHAT_ID"
+notify_plan_completed = true
+notify_plan_failed = true
+notify_component_completed = false
+"#,
+            minimal_toml()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_toml(tmp.path(), &toml_content);
+
+        std::env::remove_var("PULSAR_PLANS_DRAFTS_DIR");
+        std::env::remove_var("PULSAR_PLANS_ACTIVE_DIR");
+        std::env::remove_var("PULSAR_PLANS_COMPLETED_DIR");
+        std::env::remove_var("PULSAR_PLANS_FAILED_DIR");
+
+        let config = Config::load(&path).unwrap();
+        let tg = config.telegram.unwrap();
+        assert!(tg.enabled);
+        assert_eq!(tg.bot_token_env, "MY_BOT_TOKEN");
+        assert_eq!(tg.chat_id_env, "MY_CHAT_ID");
+        assert!(tg.notify_plan_completed);
+        assert!(tg.notify_plan_failed);
+        assert!(!tg.notify_component_completed);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_telegram_section_with_defaults() {
+        //Minimal [telegram] section — only enabled, rest defaults
+        let toml_content = format!(
+            r#"{}
+[telegram]
+enabled = true
+"#,
+            minimal_toml()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_toml(tmp.path(), &toml_content);
+
+        std::env::remove_var("PULSAR_PLANS_DRAFTS_DIR");
+        std::env::remove_var("PULSAR_PLANS_ACTIVE_DIR");
+        std::env::remove_var("PULSAR_PLANS_COMPLETED_DIR");
+        std::env::remove_var("PULSAR_PLANS_FAILED_DIR");
+
+        let config = Config::load(&path).unwrap();
+        let tg = config.telegram.unwrap();
+        assert!(tg.enabled);
+        assert_eq!(tg.bot_token_env, "TELEGRAM_BOT_TOKEN");
+        assert_eq!(tg.chat_id_env, "TELEGRAM_OWNER_ID");
+        assert!(!tg.notify_plan_completed);
+        assert!(!tg.notify_plan_failed);
+        assert!(!tg.notify_component_completed);
     }
 }

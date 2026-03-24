@@ -550,6 +550,27 @@ impl Scheduler {
                     "component finished"
                 );
 
+                //telegram: component completed notification
+                if let Some(ref tg) = self.config.telegram {
+                    if tg.notify_component_completed {
+                        if let Ok(task_for_notify) = TaskFile::parse(path) {
+                            let total = task_for_notify.components.len();
+                            let title = task_for_notify.components.iter()
+                                .find(|c| c.index == *component_index)
+                                .map(|c| c.title.as_str())
+                                .unwrap_or("unknown");
+                            let msg = format!(
+                                "📦 {} — Component {}/{} done ({})",
+                                plan_filename, component_index, total, title
+                            );
+                            let cfg = tg.clone();
+                            tokio::spawn(async move {
+                                crate::telegram::notify(&cfg, &msg).await;
+                            });
+                        }
+                    }
+                }
+
                 //reset dispatch timestamp for next component
                 if let Some(state) = self.active_plans.values_mut().find(|s| s.task_id == *task_id) {
                     state.component_dispatched_at = None;
@@ -898,6 +919,20 @@ impl Scheduler {
                                 destination = %new_path.display(),
                                 "all components done, moved to completed/"
                             );
+
+                            //telegram: plan completed notification
+                            if let Some(ref tg) = self.config.telegram {
+                                if tg.notify_plan_completed {
+                                    let msg = format!(
+                                        "✅ *Pulsar Relay* — Plan completed: `{}`\n📊 {} components",
+                                        filename, component_count
+                                    );
+                                    let cfg = tg.clone();
+                                    tokio::spawn(async move {
+                                        crate::telegram::notify(&cfg, &msg).await;
+                                    });
+                                }
+                            }
                         }
                         PlanOutcome::Failed => {
                             let failures = failed_component_details(&task);
@@ -921,6 +956,24 @@ impl Scheduler {
                                 destination = %new_path.display(),
                                 "component failed, moved to failed/"
                             );
+
+                            //telegram: plan failed notification
+                            if let Some(ref tg) = self.config.telegram {
+                                if tg.notify_plan_failed {
+                                    let failed_summary: Vec<String> = failures.iter()
+                                        .map(|(idx, title, _)| format!("  • Component {}: {}", idx, title))
+                                        .collect();
+                                    let msg = format!(
+                                        "❌ *Pulsar Relay* — Plan failed: `{}`\n{}/{} components failed:\n{}",
+                                        filename, failures.len(), component_count, failed_summary.join("\n")
+                                    );
+                                    let cfg = tg.clone();
+                                    tokio::spawn(async move {
+                                        crate::telegram::notify(&cfg, &msg).await;
+                                    });
+                                }
+                            }
+
                             //override tracker status to "failed"
                             if let Err(e) = self.tracker.mark_failed(&task_id) {
                                 warn!(

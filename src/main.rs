@@ -7,6 +7,7 @@ mod agent;
 mod tracker;
 mod ingest;
 mod checksum;
+pub mod telegram;
 
 use std::path::PathBuf;
 use tracing::{info, error};

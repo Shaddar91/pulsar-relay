@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 fs2 = "0.4"
 anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 hex = "0.4"
 tokio-stream = { version = "0.1", optional = true }

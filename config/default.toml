@@ -1,5 +1,5 @@
 [scheduler]
-#interval in seconds (900 = 15 minutes)
+#interval in seconds (60 = 1 minute)
 interval_secs = 60
 #path to AI task automation pipeline ready directory
 pipeline_ready_dir = "${AI_PROJECT_ROOT}/data/pipeline/ready"
@@ -25,6 +25,14 @@ drafts_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/drafts"
 active_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/active"
 completed_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/completed"
 failed_dir = "${FORGE_DIR}/projects/pulsar-relay/plans/failed"
+
+[telegram]
+enabled = true
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+chat_id_env = "TELEGRAM_OWNER_ID"
+notify_plan_completed = true
+notify_plan_failed = true
+notify_component_completed = false
 
 [agent]
 #path to spawn-agent-v2.sh

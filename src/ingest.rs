@@ -202,6 +202,7 @@ Do another thing.
             },
             kafka: None,
             plans: None,
+            telegram: None,
             agent: crate::config::AgentConfig {
                 spawn_script: "/dev/null".into(),
                 default_model: "sonnet".into(),
@@ -275,6 +276,7 @@ Do another thing.
             },
             kafka: None,
             plans: None,
+            telegram: None,
             agent: crate::config::AgentConfig {
                 spawn_script: "/dev/null".into(),
                 default_model: "sonnet".into(),
