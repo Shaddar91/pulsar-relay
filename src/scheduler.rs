@@ -6,9 +6,10 @@ use crate::kafka::producer::TaskProducer;
 #[cfg(feature = "kafka")]
 use crate::kafka::consumer::ResultConsumer;
 use crate::tracker::TaskTracker;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use regex::Regex;
 use tracing::{info, warn, error};
 use fs2::FileExt;
 
@@ -202,8 +203,38 @@ Component {} of plan "{}": {}
     Ok(filename)
 }
 
+//collect all .md file paths from a directory, recursing one level into subdirectories
+//handles the case where executor places completed files in date subdirs (e.g. completed/2026-03-24/)
+fn collect_md_files_recursive(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return paths,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            //recurse one level into subdirectories (date dirs)
+            if let Ok(sub_entries) = fs::read_dir(&path) {
+                for sub_entry in sub_entries.flatten() {
+                    let sub_path = sub_entry.path();
+                    if sub_path.is_file() && sub_path.extension().map(|e| e == "md").unwrap_or(false) {
+                        paths.push(sub_path);
+                    }
+                }
+            }
+        } else if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
 //scan pipeline completed/ dir for finished tasks belonging to a plan
 //returns vec of (component_index, result_text, execution_status) for completed pipeline tasks
+//handles renamed files with _completed_TIMESTAMP suffix and date subdirectories
 fn scan_pipeline_completed(
     completed_dir: &Path,
     task_id: &str,
@@ -216,32 +247,41 @@ fn scan_pipeline_completed(
         return results;
     }
 
-    let entries = match fs::read_dir(completed_dir) {
-        Ok(e) => e,
+    //regex to extract component index: after the prefix, capture digits before anything else
+    //matches: task_pulsar_{id}_{INDEX}.md or task_pulsar_{id}_{INDEX}_completed_TIMESTAMP.md
+    let pattern = format!(r"^task_pulsar_{}_(\d+)(?:_.*)?\.md$", regex::escape(&sanitized_id));
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
         Err(_) => return results,
     };
 
-    for entry in entries.flatten() {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with(&prefix) && name.ends_with(".md") {
-                //extract component index from filename: task_pulsar_{id}_{index}.md
-                let stripped = name.trim_start_matches(&prefix).trim_end_matches(".md");
-                if let Ok(idx) = stripped.parse::<usize>() {
-                    //read the completed task file for any result content and status
-                    let content = fs::read_to_string(entry.path())
-                        .unwrap_or_default();
-                    let result = extract_completed_result(&content);
-                    let status = extract_execution_status(&content);
+    let md_files = collect_md_files_recursive(completed_dir);
 
-                    info!(
-                        file = %name,
-                        task_id = %task_id,
-                        component = idx,
-                        status = %status,
-                        "found completed pipeline task"
-                    );
-                    results.push((idx, result, status));
-                }
+    for path in &md_files {
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+
+        if let Some(caps) = re.captures(name) {
+            if let Ok(idx) = caps[1].parse::<usize>() {
+                //read the completed task file for any result content and status
+                let content = fs::read_to_string(path).unwrap_or_default();
+                let result = extract_completed_result(&content);
+                let status = extract_execution_status(&content);
+
+                info!(
+                    file = %name,
+                    task_id = %task_id,
+                    component = idx,
+                    status = %status,
+                    "found completed pipeline task"
+                );
+                results.push((idx, result, status));
             }
         }
     }
@@ -277,15 +317,44 @@ fn extract_execution_status(content: &str) -> ComponentStatus {
 }
 
 //remove a completed pipeline task file after processing its result
+//handles renamed files with _completed_TIMESTAMP suffix and date subdirectories
 fn remove_completed_pipeline_task(completed_dir: &Path, task_id: &str, component_index: usize) {
     let sanitized_id = task_id.replace(' ', "_").replace('/', "_");
-    let filename = format!("task_pulsar_{}_{}.md", sanitized_id, component_index);
-    let path = completed_dir.join(&filename);
-    if path.exists() {
-        if let Err(e) = fs::remove_file(&path) {
-            warn!(path = %path.display(), error = %e, "failed to remove completed pipeline task");
+
+    //try exact filename first (fast path)
+    let exact = format!("task_pulsar_{}_{}.md", sanitized_id, component_index);
+    let exact_path = completed_dir.join(&exact);
+    if exact_path.exists() {
+        if let Err(e) = fs::remove_file(&exact_path) {
+            warn!(path = %exact_path.display(), error = %e, "failed to remove completed pipeline task");
         } else {
-            info!(path = %path.display(), "removed processed completed pipeline task");
+            info!(path = %exact_path.display(), "removed processed completed pipeline task");
+        }
+        return;
+    }
+
+    //fallback: scan for renamed files (with _completed_TIMESTAMP suffix) and date subdirs
+    let prefix = format!("task_pulsar_{}_{}", sanitized_id, component_index);
+    let md_files = collect_md_files_recursive(completed_dir);
+
+    for path in &md_files {
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        //match files starting with the component prefix (index followed by _ or .md)
+        if name.starts_with(&prefix) && name.ends_with(".md") {
+            //verify it's the right component (not a prefix collision, e.g. index 1 vs 10)
+            let after_prefix = &name[prefix.len()..];
+            if after_prefix.starts_with('.') || after_prefix.starts_with('_') {
+                if let Err(e) = fs::remove_file(path) {
+                    warn!(path = %path.display(), error = %e, "failed to remove completed pipeline task");
+                } else {
+                    info!(path = %path.display(), "removed processed completed pipeline task");
+                }
+                return;
+            }
         }
     }
 }
@@ -559,9 +628,10 @@ impl Scheduler {
                                 .find(|c| c.index == *component_index)
                                 .map(|c| c.title.as_str())
                                 .unwrap_or("unknown");
+                            let plan_name = plan_filename.trim_end_matches(".md");
                             let msg = format!(
-                                "📦 {} — Component {}/{} done ({})",
-                                plan_filename, component_index, total, title
+                                "📦 `{}` — Component {}/{} done\n\n✓ {}",
+                                plan_name, component_index, total, title
                             );
                             let cfg = tg.clone();
                             tokio::spawn(async move {
@@ -923,9 +993,12 @@ impl Scheduler {
                             //telegram: plan completed notification
                             if let Some(ref tg) = self.config.telegram {
                                 if tg.notify_plan_completed {
+                                    let component_list: Vec<String> = task.components.iter()
+                                        .map(|c| format!("  ✓ C{}: {}", c.index, c.title))
+                                        .collect();
                                     let msg = format!(
-                                        "✅ *Pulsar Relay* — Plan completed: `{}`\n📊 {} components",
-                                        filename, component_count
+                                        "✅ *Pulsar Relay* — Plan completed\n\n📋 `{}`\n📊 {} components completed\n\n{}\n",
+                                        filename.trim_end_matches(".md"), component_count, component_list.join("\n")
                                     );
                                     let cfg = tg.clone();
                                     tokio::spawn(async move {
@@ -961,11 +1034,14 @@ impl Scheduler {
                             if let Some(ref tg) = self.config.telegram {
                                 if tg.notify_plan_failed {
                                     let failed_summary: Vec<String> = failures.iter()
-                                        .map(|(idx, title, _)| format!("  • Component {}: {}", idx, title))
+                                        .map(|(idx, title, result)| {
+                                            let err = result.as_deref().unwrap_or("no details");
+                                            format!("  💥 C{}: {} — {}", idx, title, err)
+                                        })
                                         .collect();
                                     let msg = format!(
-                                        "❌ *Pulsar Relay* — Plan failed: `{}`\n{}/{} components failed:\n{}",
-                                        filename, failures.len(), component_count, failed_summary.join("\n")
+                                        "❌ *Pulsar Relay* — Plan failed\n\n📋 `{}`\n💀 {}/{} components failed:\n\n{}",
+                                        filename.trim_end_matches(".md"), failures.len(), component_count, failed_summary.join("\n")
                                     );
                                     let cfg = tg.clone();
                                     tokio::spawn(async move {
@@ -1910,6 +1986,140 @@ mod tests {
         //reset after completion
         state.component_dispatched_at = None;
         assert!(state.component_dispatched_at.is_none());
+    }
+
+    //--- Bug fix tests: filename pattern matching with _completed_ suffix ---
+
+    #[test]
+    fn test_scan_pipeline_completed_with_completed_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        fs::create_dir_all(&completed).unwrap();
+
+        //executor renames files with _completed_TIMESTAMP suffix
+        fs::write(
+            completed.join("task_pulsar_task_test_001_8_completed_20260324_002657.md"),
+            "# Completed\n**Result:** All done\n**Execution Status:** COMPLETED",
+        ).unwrap();
+
+        let results = scan_pipeline_completed(&completed, "task_test_001");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 8);
+        assert_eq!(results[0].1, "All done");
+        assert_eq!(results[0].2, ComponentStatus::Completed);
+    }
+
+    #[test]
+    fn test_scan_pipeline_completed_in_date_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        let date_dir = completed.join("2026-03-24");
+        fs::create_dir_all(&date_dir).unwrap();
+
+        //executor puts files in date subdirectories
+        fs::write(
+            date_dir.join("task_pulsar_task_test_001_3_completed_20260324_150000.md"),
+            "# Completed\n**Result:** Done in subdir",
+        ).unwrap();
+
+        let results = scan_pipeline_completed(&completed, "task_test_001");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 3);
+        assert_eq!(results[0].1, "Done in subdir");
+    }
+
+    #[test]
+    fn test_scan_pipeline_completed_mixed_locations() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        let date_dir = completed.join("2026-03-24");
+        fs::create_dir_all(&date_dir).unwrap();
+
+        //one in flat dir (original naming)
+        fs::write(
+            completed.join("task_pulsar_task_test_001_1.md"),
+            "# Completed\n**Result:** Flat",
+        ).unwrap();
+
+        //one in date subdir with _completed_ suffix
+        fs::write(
+            date_dir.join("task_pulsar_task_test_001_2_completed_20260324_150000.md"),
+            "# Completed\n**Result:** Subdir",
+        ).unwrap();
+
+        let mut results = scan_pipeline_completed(&completed, "task_test_001");
+        results.sort_by_key(|r| r.0);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[1].0, 2);
+    }
+
+    #[test]
+    fn test_scan_pipeline_completed_no_index_collision() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        fs::create_dir_all(&completed).unwrap();
+
+        //index 1 and index 10 should not collide
+        fs::write(
+            completed.join("task_pulsar_task_test_001_1_completed_20260324_120000.md"),
+            "# One",
+        ).unwrap();
+        fs::write(
+            completed.join("task_pulsar_task_test_001_10_completed_20260324_120001.md"),
+            "# Ten",
+        ).unwrap();
+
+        let mut results = scan_pipeline_completed(&completed, "task_test_001");
+        results.sort_by_key(|r| r.0);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[1].0, 10);
+    }
+
+    #[test]
+    fn test_remove_completed_pipeline_task_with_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        fs::create_dir_all(&completed).unwrap();
+
+        let file = completed.join("task_pulsar_task_test_001_5_completed_20260324_120000.md");
+        fs::write(&file, "# done").unwrap();
+        assert!(file.exists());
+
+        remove_completed_pipeline_task(&completed, "task_test_001", 5);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn test_remove_completed_pipeline_task_in_date_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let completed = tmp.path().join("completed");
+        let date_dir = completed.join("2026-03-24");
+        fs::create_dir_all(&date_dir).unwrap();
+
+        let file = date_dir.join("task_pulsar_task_test_001_2_completed_20260324_150000.md");
+        fs::write(&file, "# done").unwrap();
+        assert!(file.exists());
+
+        remove_completed_pipeline_task(&completed, "task_test_001", 2);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn test_collect_md_files_recursive_flat_and_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("completed");
+        let subdir = dir.join("2026-03-24");
+        fs::create_dir_all(&subdir).unwrap();
+
+        fs::write(dir.join("flat.md"), "# flat").unwrap();
+        fs::write(dir.join("not-md.txt"), "skip").unwrap();
+        fs::write(subdir.join("nested.md"), "# nested").unwrap();
+        fs::write(subdir.join("also-skip.json"), "{}").unwrap();
+
+        let files = collect_md_files_recursive(&dir);
+        assert_eq!(files.len(), 2);
     }
 }
 

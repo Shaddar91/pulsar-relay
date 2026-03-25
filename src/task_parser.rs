@@ -81,7 +81,13 @@ impl TaskFile {
             .unwrap_or_else(|| "Untitled".to_string());
 
         let task_id = Self::extract_field(&content, "Task ID")
-            .unwrap_or_else(|| format!("task_{}", uuid::Uuid::new_v4()));
+            .unwrap_or_else(|| {
+                //deterministic ID from filename — stable across repeated parses
+                let stem = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                format!("task_{}", stem)
+            });
 
         let scheduler_initiated = content.contains("**Scheduler:** pulsar-relay");
 
