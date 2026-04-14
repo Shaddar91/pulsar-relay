@@ -1,110 +1,219 @@
 use crate::config::AgentConfig;
+use crate::task_parser::PlanKind;
+use std::path::Path;
 use std::process::Command;
 use tracing::info;
 
-pub struct AgentSpawner {
-    spawn_script: String,
-    default_model: String,
-    prep_timeout_secs: u64,
+//pure — map a plan kind to its prompt template filename
+pub fn template_filename(kind: PlanKind) -> &'static str {
+    match kind {
+        PlanKind::Execution => "prep-execution.md",
+        PlanKind::Research => "prep-research.md",
+    }
 }
 
-impl AgentSpawner {
-    pub fn new(config: &AgentConfig) -> Self {
-        Self {
-            spawn_script: config.spawn_script.to_string_lossy().to_string(),
-            default_model: config.default_model.clone(),
-            prep_timeout_secs: config.prep_timeout_secs,
-        }
+//pure — substitute {{key}} placeholders in a template with values
+//unknown placeholders are left as-is (deliberate: makes debugging easier)
+pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
+    vars.iter().fold(template.to_string(), |acc, (key, value)| {
+        acc.replace(&format!("{{{{{}}}}}", key), value)
+    })
+}
+
+//IO — load a prompt template from disk for a given plan kind
+pub fn load_template(dir: &Path, kind: PlanKind) -> anyhow::Result<String> {
+    let path = dir.join(template_filename(kind));
+    std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("failed to load template {}: {}", path.display(), e))
+}
+
+//IO — invoke spawn-agent-v2.sh with a rendered prompt
+//returns the agent's stdout; caller parses the STATUS= line
+async fn invoke_spawn_script(
+    script: &str,
+    agent_name: &str,
+    model: &str,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let script = script.to_string();
+    let agent = agent_name.to_string();
+    let model = model.to_string();
+    let prompt = prompt.to_string();
+
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("bash")
+            .arg(&script)
+            .arg("--agent")
+            .arg(&agent)
+            .arg("--model")
+            .arg(&model)
+            .arg("--prompt")
+            .arg(&prompt)
+            .env("PULSAR_RELAY_TASK", "true")
+            .output()
+    })
+    .await??;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(anyhow::anyhow!(
+            "prep agent exited with {}: {}",
+            output.status,
+            stderr
+        ))
+    }
+}
+
+//pure — parse the first-line STATUS= contract from agent stdout
+//returns None if the output doesn't start with STATUS=
+pub fn parse_status_line(stdout: &str) -> Option<&str> {
+    stdout.lines().next().and_then(|l| l.strip_prefix("STATUS="))
+}
+
+//coordinator — composes load + render + spawn for one prep-agent invocation
+pub struct PrepAgentSpawner {
+    config: AgentConfig,
+}
+
+impl PrepAgentSpawner {
+    pub fn new(config: AgentConfig) -> Self {
+        Self { config }
     }
 
-    //spawn an agent to work on a specific component of a task
-    //the agent reads the full task file, identifies the current component,
-    //works on it, and writes results back to the file
+    //spawn the prep agent for a given plan + kind
+    //the agent reads the plan, retrieves prior pipeline completions, dispatches next component, exits
     pub async fn spawn(
         &self,
-        agent_name: &str,
-        task_file_path: &str,
-        component_index: usize,
+        plan_path: &Path,
+        plan_kind: PlanKind,
     ) -> anyhow::Result<String> {
-        let prompt = format!(
-            "You are working on a sequential multi-component task managed by pulsar-relay scheduler.\n\
-             \n\
-             TASK FILE: {}\n\
-             CURRENT COMPONENT: Component {}\n\
-             \n\
-             Instructions:\n\
-             1. Read the full task file to understand the overall goal and previous components' results\n\
-             2. Focus ONLY on Component {} — do not work on other components\n\
-             3. Complete the work described in Component {}\n\
-             4. Your output will be captured and written back to the task file as the result\n\
-             5. If you need information from previous components, check their **Result:** sections\n\
-             \n\
-             **Scheduler:** pulsar-relay\n\
-             **Component:** {}\n\
-             \n\
-             Read the task file and begin working on Component {}.",
-            task_file_path,
-            component_index,
-            component_index,
-            component_index,
-            component_index,
-            component_index,
-        );
+        let template = load_template(&self.config.prep_template_dir, plan_kind)?;
+        let plan_path_str = plan_path.to_string_lossy().to_string();
+        let plan_kind_str = plan_kind.to_string();
+        let vars = [
+            ("plan_path", plan_path_str.as_str()),
+            ("plan_kind", plan_kind_str.as_str()),
+        ];
+        let rendered = render_template(&template, &vars);
 
         info!(
-            agent = %agent_name,
-            task_file = %task_file_path,
-            component = component_index,
-            "spawning agent"
+            plan_path = %plan_path.display(),
+            plan_kind = %plan_kind,
+            agent = %self.config.prep_agent_name,
+            "spawning prep agent"
         );
 
-        //spawn via spawn-agent-v2.sh
-        let output = tokio::task::spawn_blocking({
-            let script = self.spawn_script.clone();
-            let model = self.default_model.clone();
-            let agent = agent_name.to_string();
-            let prompt = prompt.clone();
-            let _timeout = self.prep_timeout_secs;
-
-            move || {
-                let result = Command::new("bash")
-                    .arg(&script)
-                    .arg("--agent")
-                    .arg(&agent)
-                    .arg("--model")
-                    .arg(&model)
-                    .arg("--prompt")
-                    .arg(&prompt)
-                    .env("PULSAR_RELAY_TASK", "true")
-                    .output();
-
-                match result {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                        if output.status.success() {
-                            Ok(stdout)
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "agent exited with {}: {}",
-                                output.status,
-                                stderr
-                            ))
-                        }
-                    }
-                    Err(e) => Err(anyhow::anyhow!("failed to spawn agent: {}", e)),
-                }
-            }
-        }).await??;
+        let stdout = invoke_spawn_script(
+            &self.config.spawn_script.to_string_lossy(),
+            &self.config.prep_agent_name,
+            &self.config.default_model,
+            &rendered,
+        )
+        .await?;
 
         info!(
-            agent = %agent_name,
-            component = component_index,
-            output_len = output.len(),
-            "agent completed"
+            plan_path = %plan_path.display(),
+            output_len = stdout.len(),
+            "prep agent completed"
         );
 
-        Ok(output)
+        Ok(stdout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_template_filename_execution() {
+        assert_eq!(template_filename(PlanKind::Execution), "prep-execution.md");
+    }
+
+    #[test]
+    fn test_template_filename_research() {
+        assert_eq!(template_filename(PlanKind::Research), "prep-research.md");
+    }
+
+    #[test]
+    fn test_render_template_single_var() {
+        let tpl = "Hello {{name}}";
+        let out = render_template(tpl, &[("name", "world")]);
+        assert_eq!(out, "Hello world");
+    }
+
+    #[test]
+    fn test_render_template_multiple_vars() {
+        let tpl = "Plan at {{path}} is kind {{kind}}";
+        let out = render_template(tpl, &[("path", "/tmp/plan.md"), ("kind", "EXECUTION")]);
+        assert_eq!(out, "Plan at /tmp/plan.md is kind EXECUTION");
+    }
+
+    #[test]
+    fn test_render_template_repeated_var() {
+        let tpl = "{{x}} and {{x}} again";
+        let out = render_template(tpl, &[("x", "foo")]);
+        assert_eq!(out, "foo and foo again");
+    }
+
+    #[test]
+    fn test_render_template_unknown_var_kept_as_is() {
+        let tpl = "Hello {{name}} — {{mystery}}";
+        let out = render_template(tpl, &[("name", "world")]);
+        assert_eq!(out, "Hello world — {{mystery}}");
+    }
+
+    #[test]
+    fn test_render_template_no_vars() {
+        let tpl = "plain text";
+        let out = render_template(tpl, &[]);
+        assert_eq!(out, "plain text");
+    }
+
+    #[test]
+    fn test_load_template_missing_file_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = load_template(tmp.path(), PlanKind::Execution);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_template_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("prep-execution.md");
+        std::fs::write(&path, "hello {{x}}").unwrap();
+        let result = load_template(tmp.path(), PlanKind::Execution).unwrap();
+        assert_eq!(result, "hello {{x}}");
+    }
+
+    #[test]
+    fn test_load_template_picks_right_file_for_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("prep-execution.md"), "exec").unwrap();
+        std::fs::write(tmp.path().join("prep-research.md"), "research").unwrap();
+        assert_eq!(load_template(tmp.path(), PlanKind::Execution).unwrap(), "exec");
+        assert_eq!(load_template(tmp.path(), PlanKind::Research).unwrap(), "research");
+    }
+
+    #[test]
+    fn test_parse_status_line_ok() {
+        assert_eq!(parse_status_line("STATUS=ok dispatched task_foo\nextra line"), Some("ok dispatched task_foo"));
+    }
+
+    #[test]
+    fn test_parse_status_line_failed() {
+        assert_eq!(parse_status_line("STATUS=failed missing plan"), Some("failed missing plan"));
+    }
+
+    #[test]
+    fn test_parse_status_line_no_prefix() {
+        assert_eq!(parse_status_line("not a status line"), None);
+    }
+
+    #[test]
+    fn test_parse_status_line_empty() {
+        assert_eq!(parse_status_line(""), None);
     }
 }
