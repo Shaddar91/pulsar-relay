@@ -5,7 +5,7 @@ use tracing::info;
 pub struct AgentSpawner {
     spawn_script: String,
     default_model: String,
-    timeout_secs: u64,
+    prep_timeout_secs: u64,
 }
 
 impl AgentSpawner {
@@ -13,7 +13,7 @@ impl AgentSpawner {
         Self {
             spawn_script: config.spawn_script.to_string_lossy().to_string(),
             default_model: config.default_model.clone(),
-            timeout_secs: config.component_timeout_secs,
+            prep_timeout_secs: config.prep_timeout_secs,
         }
     }
 
@@ -64,7 +64,7 @@ impl AgentSpawner {
             let model = self.default_model.clone();
             let agent = agent_name.to_string();
             let prompt = prompt.clone();
-            let _timeout = self.timeout_secs;
+            let _timeout = self.prep_timeout_secs;
 
             move || {
                 let result = Command::new("bash")

@@ -39,7 +39,9 @@ lock_file = "{}/scheduler.lock"
 [agent]
 spawn_script = "{}"
 default_model = "sonnet"
-component_timeout_secs = 30
+prep_timeout_secs = 30
+prep_template_dir = "/tmp/pulsar-prompts"
+prep_agent_name = "pulsar-prep"
 "#,
         interval_secs,
         test_dir.display(),
@@ -861,7 +863,9 @@ failed_dir = "{}/plans/failed"
 [agent]
 spawn_script = "{}"
 default_model = "sonnet"
-component_timeout_secs = 30
+prep_timeout_secs = 30
+prep_template_dir = "/tmp/pulsar-prompts"
+prep_agent_name = "pulsar-prep"
 "#,
         interval_secs,
         test_dir.display(),

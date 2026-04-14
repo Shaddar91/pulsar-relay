@@ -37,7 +37,12 @@ notify_component_completed = false
 [agent]
 #path to spawn-agent-v2.sh
 spawn_script = "${AI_PROJECT_ROOT}/scripts/spawn-agent-v2.sh"
-#default model for spawned agents
+#default model for the prep agent
 default_model = "sonnet"
-#timeout per component in seconds (30 min)
-component_timeout_secs = 1800
+#timeout for the prep agent (short — it only reads + dispatches, doesn't execute work)
+prep_timeout_secs = 600
+#directory containing prep-agent prompt templates (prep-execution.md, prep-research.md)
+#override at runtime via PULSAR_PREP_TEMPLATE_DIR for A/B testing prompts
+prep_template_dir = "${PULSAR_RELAY_DIR}/prompts"
+#generic prep agent name — must exist at $AI_PROJECT_ROOT/agents/models/default/<name>.json
+prep_agent_name = "pulsar-prep"

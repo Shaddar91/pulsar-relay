@@ -206,7 +206,9 @@ Do another thing.
             agent: crate::config::AgentConfig {
                 spawn_script: "/dev/null".into(),
                 default_model: "sonnet".into(),
-                component_timeout_secs: 30,
+                prep_timeout_secs: 30,
+                prep_template_dir: "/tmp/pulsar-prompts".into(),
+                prep_agent_name: "pulsar-prep".into(),
             },
         }
     }
@@ -280,7 +282,9 @@ Do another thing.
             agent: crate::config::AgentConfig {
                 spawn_script: "/dev/null".into(),
                 default_model: "sonnet".into(),
-                component_timeout_secs: 30,
+                prep_timeout_secs: 30,
+                prep_template_dir: "/tmp/pulsar-prompts".into(),
+                prep_agent_name: "pulsar-prep".into(),
             },
         };
 

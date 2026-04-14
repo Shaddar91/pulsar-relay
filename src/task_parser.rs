@@ -53,6 +53,44 @@ pub enum ComponentStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PlanKind {
+    Execution,
+    Research,
+}
+
+impl std::fmt::Display for PlanKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanKind::Execution => write!(f, "EXECUTION"),
+            PlanKind::Research => write!(f, "RESEARCH"),
+        }
+    }
+}
+
+//extract the **Plan Kind:** value from a plan's markdown content
+pub fn extract_plan_kind(content: &str) -> Option<PlanKind> {
+    content.lines()
+        .find(|l| l.starts_with("**Plan Kind:**"))
+        .and_then(|l| {
+            let v = l.split("**Plan Kind:**").nth(1)?.trim();
+            match v {
+                "EXECUTION" => Some(PlanKind::Execution),
+                "RESEARCH" => Some(PlanKind::Research),
+                _ => None,
+            }
+        })
+}
+
+//extract the **Project:** field verbatim (does NOT parse [[...]] wikilinks —
+//pulsar passes the value through to the pipeline as opaque metadata)
+pub fn extract_project(content: &str) -> Option<String> {
+    content.lines()
+        .find(|l| l.starts_with("**Project:**"))
+        .map(|l| l.split("**Project:**").nth(1).unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl std::fmt::Display for ComponentStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -592,5 +630,61 @@ Do it too.
         let task = TaskFile::parse(f.path()).unwrap();
         assert!(task.is_finished());
         assert!(task.next_pending().is_none());
+    }
+
+    //--- PlanKind / extract_plan_kind / extract_project tests ---
+
+    #[test]
+    fn test_extract_plan_kind_execution() {
+        let content = "# Some Plan\n**Scheduler:** pulsar-relay\n**Plan Kind:** EXECUTION\n";
+        assert_eq!(extract_plan_kind(content), Some(PlanKind::Execution));
+    }
+
+    #[test]
+    fn test_extract_plan_kind_research() {
+        let content = "# Some Plan\n**Plan Kind:** RESEARCH\n";
+        assert_eq!(extract_plan_kind(content), Some(PlanKind::Research));
+    }
+
+    #[test]
+    fn test_extract_plan_kind_missing() {
+        let content = "# No Kind\n**Scheduler:** pulsar-relay\n";
+        assert_eq!(extract_plan_kind(content), None);
+    }
+
+    #[test]
+    fn test_extract_plan_kind_unknown_value() {
+        let content = "**Plan Kind:** BOGUS\n";
+        assert_eq!(extract_plan_kind(content), None);
+    }
+
+    #[test]
+    fn test_extract_plan_kind_display() {
+        assert_eq!(format!("{}", PlanKind::Execution), "EXECUTION");
+        assert_eq!(format!("{}", PlanKind::Research), "RESEARCH");
+    }
+
+    #[test]
+    fn test_extract_project_wikilink() {
+        let content = "# Plan\n**Project:** [[authentic-web]]\n";
+        assert_eq!(extract_project(content), Some("[[authentic-web]]".to_string()));
+    }
+
+    #[test]
+    fn test_extract_project_plain() {
+        let content = "**Project:** pulsar-relay\n";
+        assert_eq!(extract_project(content), Some("pulsar-relay".to_string()));
+    }
+
+    #[test]
+    fn test_extract_project_missing() {
+        let content = "# No project\n";
+        assert_eq!(extract_project(content), None);
+    }
+
+    #[test]
+    fn test_extract_project_empty_is_none() {
+        let content = "**Project:**   \n";
+        assert_eq!(extract_project(content), None);
     }
 }

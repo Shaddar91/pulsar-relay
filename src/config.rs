@@ -47,7 +47,9 @@ pub struct PlansConfig {
 pub struct AgentConfig {
     pub spawn_script: PathBuf,
     pub default_model: String,
-    pub component_timeout_secs: u64,
+    pub prep_timeout_secs: u64,
+    pub prep_template_dir: PathBuf,
+    pub prep_agent_name: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -139,6 +141,11 @@ impl Config {
         config.scheduler.task_queue_dir = expand_path(config.scheduler.task_queue_dir);
         config.scheduler.lock_file = expand_path(config.scheduler.lock_file);
         config.agent.spawn_script = expand_path(config.agent.spawn_script);
+        config.agent.prep_template_dir = expand_path(config.agent.prep_template_dir);
+        config.agent.prep_template_dir = env_override(
+            config.agent.prep_template_dir.clone(),
+            "PULSAR_PREP_TEMPLATE_DIR",
+        );
         if let Some(ref mut p) = config.plans {
             p.drafts_dir = expand_path(std::mem::take(&mut p.drafts_dir));
             p.active_dir = expand_path(std::mem::take(&mut p.active_dir));
@@ -189,7 +196,9 @@ lock_file = "/tmp/lock"
 [agent]
 spawn_script = "/dev/null"
 default_model = "sonnet"
-component_timeout_secs = 30
+prep_timeout_secs = 30
+prep_template_dir = "/tmp/pulsar-prompts"
+prep_agent_name = "pulsar-prep"
 "#
     }
 
