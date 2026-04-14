@@ -28,19 +28,25 @@ pub fn load_template(dir: &Path, kind: PlanKind) -> anyhow::Result<String> {
 }
 
 //IO — invoke spawn-agent-v2.sh with a rendered prompt
+//pipeline_ready_dir is exported as PULSAR_PIPELINE_READY_DIR so the prep agent
+//knows where to drop pipeline task files (works for both real Claude agents via
+//their Bash tool and for the test mock via env expansion)
 //returns the agent's stdout; caller parses the STATUS= line
 async fn invoke_spawn_script(
     script: &str,
     agent_name: &str,
     model: &str,
     prompt: &str,
+    pipeline_ready_dir: &str,
+    timeout_secs: u64,
 ) -> anyhow::Result<String> {
     let script = script.to_string();
     let agent = agent_name.to_string();
     let model = model.to_string();
     let prompt = prompt.to_string();
+    let ready_dir = pipeline_ready_dir.to_string();
 
-    let output = tokio::task::spawn_blocking(move || {
+    let spawn_handle = tokio::task::spawn_blocking(move || {
         Command::new("bash")
             .arg(&script)
             .arg("--agent")
@@ -50,9 +56,16 @@ async fn invoke_spawn_script(
             .arg("--prompt")
             .arg(&prompt)
             .env("PULSAR_RELAY_TASK", "true")
+            .env("PULSAR_PIPELINE_READY_DIR", &ready_dir)
             .output()
-    })
-    .await??;
+    });
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        spawn_handle,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("prep agent timed out after {}s", timeout_secs))???;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -82,19 +95,22 @@ impl PrepAgentSpawner {
         Self { config }
     }
 
-    //spawn the prep agent for a given plan + kind
+    //spawn the prep agent for a given plan + kind + target pipeline dir
     //the agent reads the plan, retrieves prior pipeline completions, dispatches next component, exits
     pub async fn spawn(
         &self,
         plan_path: &Path,
         plan_kind: PlanKind,
+        pipeline_ready_dir: &Path,
     ) -> anyhow::Result<String> {
         let template = load_template(&self.config.prep_template_dir, plan_kind)?;
         let plan_path_str = plan_path.to_string_lossy().to_string();
         let plan_kind_str = plan_kind.to_string();
+        let ready_dir_str = pipeline_ready_dir.to_string_lossy().to_string();
         let vars = [
             ("plan_path", plan_path_str.as_str()),
             ("plan_kind", plan_kind_str.as_str()),
+            ("pipeline_ready_dir", ready_dir_str.as_str()),
         ];
         let rendered = render_template(&template, &vars);
 
@@ -110,6 +126,8 @@ impl PrepAgentSpawner {
             &self.config.prep_agent_name,
             &self.config.default_model,
             &rendered,
+            &ready_dir_str,
+            self.config.prep_timeout_secs,
         )
         .await?;
 

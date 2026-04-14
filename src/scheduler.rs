@@ -1,6 +1,7 @@
+use crate::agent::{PrepAgentSpawner, parse_status_line};
 use crate::checksum;
 use crate::config::Config;
-use crate::task_parser::{TaskFile, Component, ComponentStatus};
+use crate::task_parser::{TaskFile, Component, ComponentStatus, PlanKind, extract_plan_kind};
 #[cfg(feature = "kafka")]
 use crate::kafka::producer::TaskProducer;
 #[cfg(feature = "kafka")]
@@ -17,6 +18,7 @@ pub struct Scheduler {
     config: Config,
     tracker: TaskTracker,
     active_plans: HashMap<String, ActivePlanState>,
+    prep_spawner: PrepAgentSpawner,
     #[cfg(feature = "kafka")]
     kafka_producer: Option<TaskProducer>,
     #[cfg(feature = "kafka")]
@@ -129,78 +131,6 @@ fn current_component_index(task: &TaskFile) -> usize {
         .find(|c| c.status == ComponentStatus::InProgress || c.status == ComponentStatus::Pending)
         .map(|c| c.index)
         .unwrap_or(0)
-}
-
-//write a pipeline task file for a dispatched component
-//this is the ONLY dispatch method — pipeline executors pick up from ready/
-fn write_pipeline_task(
-    pipeline_ready_dir: &Path,
-    task: &TaskFile,
-    component: &Component,
-) -> anyhow::Result<String> {
-    fs::create_dir_all(pipeline_ready_dir)?;
-
-    let sanitized_id = task.task_id.replace(' ', "_").replace('/', "_");
-    let filename = format!("task_pulsar_{}_{}.md", sanitized_id, component.index);
-    let agent = component.agent.as_deref().unwrap_or("backend-developer");
-
-    let content = format!(
-        r#"# Task: {} — Component {}
-
-**Task ID:** {}_component_{}
-**Created:** {}
-**Scheduler:** pulsar-relay
-**Plan File:** {}
-**Component:** {}
-**Priority:** Medium
-**Type:** code
-**Target Agent:** {}
-**Agent Available:** Yes
-**Routing Confidence:** 95%
-**Ready Status:** READY_FOR_EXECUTION
-
-## Summary
-Component {} of plan "{}": {}
-
-## Instructions
-
-{}
-
-## Dynamic Agent Config
-```json
-{{
-  "agent": "{}",
-  "source": "agents/models/default/{}.json"
-}}
-```
-"#,
-        task.title,
-        component.index,
-        sanitized_id,
-        component.index,
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-        task.path,
-        component.index,
-        agent,
-        component.index,
-        task.title,
-        component.title,
-        component.content,
-        agent,
-        agent,
-    );
-
-    let filepath = pipeline_ready_dir.join(&filename);
-    fs::write(&filepath, content)?;
-
-    info!(
-        file = %filepath.display(),
-        task_id = %task.task_id,
-        component = component.index,
-        "pipeline task file written to ready/"
-    );
-
-    Ok(filename)
 }
 
 //collect all .md file paths from a directory, recursing one level into subdirectories
@@ -420,6 +350,7 @@ fn failed_component_details(task: &TaskFile) -> Vec<(usize, String, Option<Strin
 impl Scheduler {
     pub fn new(config: Config) -> Self {
         let tracker = TaskTracker::new(config.scheduler.task_queue_dir.clone());
+        let prep_spawner = PrepAgentSpawner::new(config.agent.clone());
 
         #[cfg(feature = "kafka")]
         let (kafka_producer, kafka_consumer) = init_kafka(&config);
@@ -428,6 +359,7 @@ impl Scheduler {
             config,
             tracker,
             active_plans: HashMap::new(),
+            prep_spawner,
             #[cfg(feature = "kafka")]
             kafka_producer,
             #[cfg(feature = "kafka")]
@@ -842,7 +774,7 @@ impl Scheduler {
             component = component.index,
             title = %component.title,
             agent = %agent,
-            "dispatching component to pipeline"
+            "dispatching component via prep agent"
         );
 
         //1. mark IN_PROGRESS FIRST — before any dispatch (closes race window)
@@ -857,26 +789,42 @@ impl Scheduler {
             warn!(error = %e, "failed to update plan header");
         }
 
-        //2. write pipeline task file to ready/ — pipeline executors pick this up
-        if let Err(e) = write_pipeline_task(
+        //2. extract plan kind (defaults to Execution if header missing — preserves
+        //backward compat with plans written before the Plan Kind contract)
+        let plan_content = fs::read_to_string(&task.path)?;
+        let plan_kind = extract_plan_kind(&plan_content).unwrap_or(PlanKind::Execution);
+
+        //3. spawn prep agent — agent writes the pipeline task file to ready/
+        match self.prep_spawner.spawn(
+            Path::new(&task.path),
+            plan_kind,
             &self.config.scheduler.pipeline_ready_dir,
-            task,
-            component,
-        ) {
-            error!(
-                task_id = %task.task_id,
-                component = component.index,
-                error = %e,
-                "failed to write pipeline task file"
-            );
-            //rollback: mark component back to PENDING since dispatch failed
-            TaskFile::update_component_status(
-                Path::new(&task.path),
-                component.index,
-                ComponentStatus::Pending,
-                None,
-            )?;
-            return Err(e);
+        ).await {
+            Ok(stdout) => {
+                let status = parse_status_line(&stdout).unwrap_or("ok unknown");
+                info!(
+                    task_id = %task.task_id,
+                    component = component.index,
+                    prep_status = %status,
+                    "prep agent completed"
+                );
+            }
+            Err(e) => {
+                error!(
+                    task_id = %task.task_id,
+                    component = component.index,
+                    error = %e,
+                    "prep agent failed"
+                );
+                //rollback: mark component back to PENDING since dispatch failed
+                TaskFile::update_component_status(
+                    Path::new(&task.path),
+                    component.index,
+                    ComponentStatus::Pending,
+                    None,
+                )?;
+                return Err(e);
+            }
         }
 
         //3. publish to kafka for tracking/durability (non-fatal)
@@ -1351,65 +1299,6 @@ mod tests {
 
         //should not panic
         cleanup_pipeline_task(&ready, &processing, "task_test_001", 3);
-    }
-
-    #[test]
-    fn test_write_pipeline_task_creates_file() {
-        let tmp = TempDir::new().unwrap();
-        let ready_dir = tmp.path().join("ready");
-
-        let task = crate::task_parser::TaskFile {
-            path: "/tmp/test-plan.md".to_string(),
-            title: "Test Plan".to_string(),
-            task_id: "task_test_write_001".to_string(),
-            components: vec![crate::task_parser::Component {
-                index: 1,
-                title: "First step".to_string(),
-                status: crate::task_parser::ComponentStatus::Pending,
-                agent: Some("rust-developer".to_string()),
-                content: "Do the thing.".to_string(),
-                result: None,
-            }],
-            scheduler_initiated: true,
-        };
-
-        let filename = write_pipeline_task(&ready_dir, &task, &task.components[0]).unwrap();
-        assert_eq!(filename, "task_pulsar_task_test_write_001_1.md");
-
-        let filepath = ready_dir.join(&filename);
-        assert!(filepath.exists());
-
-        let content = fs::read_to_string(&filepath).unwrap();
-        assert!(content.contains("**Scheduler:** pulsar-relay"));
-        assert!(content.contains("**Target Agent:** rust-developer"));
-        assert!(content.contains("**Plan File:** /tmp/test-plan.md"));
-        assert!(content.contains("**Component:** 1"));
-        assert!(content.contains("Do the thing."));
-    }
-
-    #[test]
-    fn test_write_pipeline_task_default_agent() {
-        let tmp = TempDir::new().unwrap();
-        let ready_dir = tmp.path().join("ready");
-
-        let task = crate::task_parser::TaskFile {
-            path: "/tmp/plan.md".to_string(),
-            title: "Plan".to_string(),
-            task_id: "task_default_agent".to_string(),
-            components: vec![crate::task_parser::Component {
-                index: 1,
-                title: "Step".to_string(),
-                status: crate::task_parser::ComponentStatus::Pending,
-                agent: None,
-                content: "Work.".to_string(),
-                result: None,
-            }],
-            scheduler_initiated: true,
-        };
-
-        write_pipeline_task(&ready_dir, &task, &task.components[0]).unwrap();
-        let content = fs::read_to_string(ready_dir.join("task_pulsar_task_default_agent_1.md")).unwrap();
-        assert!(content.contains("**Target Agent:** backend-developer"));
     }
 
     #[test]

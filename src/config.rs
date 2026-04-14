@@ -166,15 +166,6 @@ impl Config {
 
         Ok(config)
     }
-
-    //Convenience accessor — returns plans config or error
-    pub fn plans(&self) -> anyhow::Result<&PlansConfig> {
-        self.plans.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no [plans] section in config and PULSAR_PLANS_*_DIR env vars not set"
-            )
-        })
-    }
 }
 
 #[cfg(test)]
@@ -235,7 +226,7 @@ failed_dir = "/toml/failed"
         std::env::remove_var("PULSAR_PLANS_FAILED_DIR");
 
         let config = Config::load(&path).unwrap();
-        let plans = config.plans().unwrap();
+        let plans = config.plans.as_ref().expect("plans config expected");
         assert_eq!(plans.drafts_dir, PathBuf::from("/toml/drafts"));
         assert_eq!(plans.active_dir, PathBuf::from("/toml/active"));
         assert_eq!(plans.completed_dir, PathBuf::from("/toml/completed"));
@@ -256,7 +247,6 @@ failed_dir = "/toml/failed"
 
         let config = Config::load(&path).unwrap();
         assert!(config.plans.is_none());
-        assert!(config.plans().is_err());
     }
 
     #[test]
@@ -271,7 +261,7 @@ failed_dir = "/toml/failed"
         std::env::set_var("PULSAR_PLANS_FAILED_DIR", "/env/failed");
 
         let config = Config::load(&path).unwrap();
-        let plans = config.plans().unwrap();
+        let plans = config.plans.as_ref().expect("plans config expected");
         assert_eq!(plans.drafts_dir, PathBuf::from("/env/drafts"));
         assert_eq!(plans.active_dir, PathBuf::from("/env/active"));
         assert_eq!(plans.completed_dir, PathBuf::from("/env/completed"));
@@ -296,7 +286,7 @@ failed_dir = "/toml/failed"
         std::env::set_var("PULSAR_PLANS_FAILED_DIR", "/env/failed");
 
         let config = Config::load(&path).unwrap();
-        let plans = config.plans().unwrap();
+        let plans = config.plans.as_ref().expect("plans config expected");
         assert_eq!(plans.drafts_dir, PathBuf::from("/env/drafts"));
         assert_eq!(plans.active_dir, PathBuf::from("/env/active"));
 
@@ -319,7 +309,7 @@ failed_dir = "/toml/failed"
             std::env::remove_var("PULSAR_PLANS_FAILED_DIR");
 
             let config = Config::load(&path).unwrap();
-            let plans = config.plans().unwrap();
+            let plans = config.plans.as_ref().expect("plans config expected");
             assert!(plans.drafts_dir.to_str().unwrap().contains("drafts"));
             assert!(plans.active_dir.to_str().unwrap().contains("active"));
         }

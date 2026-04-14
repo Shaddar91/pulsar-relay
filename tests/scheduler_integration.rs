@@ -40,7 +40,7 @@ lock_file = "{}/scheduler.lock"
 spawn_script = "{}"
 default_model = "sonnet"
 prep_timeout_secs = 30
-prep_template_dir = "/tmp/pulsar-prompts"
+prep_template_dir = "{}"
 prep_agent_name = "pulsar-prep"
 "#,
         interval_secs,
@@ -50,6 +50,7 @@ prep_agent_name = "pulsar-prep"
         test_dir.display(),
         test_dir.display(),
         mock_script_path().display(),
+        PathBuf::from(PROJECT_ROOT).join("prompts").display(),
     );
     fs::write(&config_path, config).unwrap();
     config_path
@@ -864,7 +865,7 @@ failed_dir = "{}/plans/failed"
 spawn_script = "{}"
 default_model = "sonnet"
 prep_timeout_secs = 30
-prep_template_dir = "/tmp/pulsar-prompts"
+prep_template_dir = "{}"
 prep_agent_name = "pulsar-prep"
 "#,
         interval_secs,
@@ -878,6 +879,7 @@ prep_agent_name = "pulsar-prep"
         test_dir.display(),
         test_dir.display(),
         mock_script_path().display(),
+        PathBuf::from(PROJECT_ROOT).join("prompts").display(),
     );
     fs::write(&config_path, config).unwrap();
     config_path
@@ -1274,7 +1276,7 @@ fn test_one_plan_failure_does_not_affect_other() {
     let config_path = write_test_config_with_plans(&test_dir, 2);
     let active_dir = test_dir.join("plans/active");
     let completed_dir = test_dir.join("plans/completed");
-    let failed_dir = test_dir.join("plans/failed");
+    let _failed_dir = test_dir.join("plans/failed");
 
     //alpha: normal plan that should succeed
     write_plan_file(&active_dir, "test-plan-alpha.md", alpha_plan_content());
@@ -1378,7 +1380,7 @@ Do third work.
     //start a background process that will modify the plan file after 5 seconds
     //this simulates mid-flight modification while the scheduler is running
     let plan_path = active_dir.join("test-midmod.md");
-    let modifier = Command::new("bash")
+    let _modifier = Command::new("bash")
         .arg("-c")
         .arg(format!(
             "sleep 5 && if [ -f '{}' ]; then sed -i 's/Do third work./Do third work.\\n\\n**MODIFIED:** Added mid-flight./' '{}'; fi",
@@ -1521,7 +1523,7 @@ fn test_failure_isolation_other_plan_unaffected() {
     let test_dir = setup_test_dir_with_plans("failure-isolation-v2");
     let config_path = write_test_config_with_plans(&test_dir, 2);
     let active_dir = test_dir.join("plans/active");
-    let pipeline_ready = test_dir.join("pipeline/ready");
+    let _pipeline_ready = test_dir.join("pipeline/ready");
 
     //plan with a failing agent
     let failing_plan = r#"# Failing Isolation Plan
